@@ -16,6 +16,26 @@ import type {
   Topic,
   TopicCreate,
   TopicUpdate,
+  QuestionListItem,
+  QuestionDetail,
+  QuestionUpdateRequest,
+  RejectRequest,
+  QuestionStatusResponse,
+  Exam,
+  ExamListItem,
+  AssembleExamRequest,
+  AddExamQuestionRequest,
+  ReorderExamQuestionsRequest,
+  ExamQuestion,
+  BlueprintListItem,
+  BlueprintResponse,
+  BlueprintCreateRequest,
+  StartGenerationResponse,
+  JobResponse,
+  CreatePracticeSetRequest,
+  PracticeSetResponse,
+  ExportRecord,
+  ExportPairResponse,
 } from '../types/api'
 
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string) ?? ''
@@ -137,4 +157,164 @@ export const topicsApi = {
         throw new ApiError(res.status, text)
       }
     }),
+}
+
+// ── Questions ─────────────────────────────────────────────────────
+
+export interface ListQuestionsParams {
+  type?: string
+  difficulty?: string
+  status?: string
+  limit?: number
+  offset?: number
+}
+
+export const questionsApi = {
+  /**
+   * List questions for a course with optional server-side filters.
+   * GET /api/v1/courses/{courseId}/questions
+   */
+  listByCourse: (courseId: string, params: ListQuestionsParams = {}) => {
+    const qs = new URLSearchParams()
+    if (params.type) qs.set('type', params.type)
+    if (params.difficulty) qs.set('difficulty', params.difficulty)
+    if (params.status) qs.set('status', params.status)
+    if (params.limit != null) qs.set('limit', String(params.limit))
+    if (params.offset != null) qs.set('offset', String(params.offset))
+    const query = qs.toString() ? `?${qs.toString()}` : ''
+    return apiRequest<QuestionListItem[]>(`/courses/${courseId}/questions${query}`)
+  },
+
+  /** GET /api/v1/questions/{questionId} — full detail with options + sources */
+  get: (questionId: string) =>
+    apiRequest<QuestionDetail>(`/questions/${questionId}`),
+
+  /** PATCH /api/v1/questions/{questionId} */
+  update: (questionId: string, body: QuestionUpdateRequest) =>
+    apiRequest<QuestionDetail>(`/questions/${questionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  /** POST /api/v1/questions/{questionId}/approve */
+  approve: (questionId: string) =>
+    apiRequest<QuestionStatusResponse>(`/questions/${questionId}/approve`, {
+      method: 'POST',
+    }),
+
+  /** POST /api/v1/questions/{questionId}/reject */
+  reject: (questionId: string, body: RejectRequest = {}) =>
+    apiRequest<QuestionStatusResponse>(`/questions/${questionId}/reject`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+}
+
+// ── Blueprints ────────────────────────────────────────────────────
+
+export const blueprintsApi = {
+  /** GET /api/v1/courses/{courseId}/blueprints */
+  listByCourse: (courseId: string) =>
+    apiRequest<BlueprintListItem[]>(`/courses/${courseId}/blueprints`),
+
+  /** POST /api/v1/courses/{courseId}/blueprints */
+  create: (courseId: string, body: BlueprintCreateRequest) =>
+    apiRequest<BlueprintResponse>(`/courses/${courseId}/blueprints`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** GET /api/v1/blueprints/{blueprintId} */
+  get: (blueprintId: string) =>
+    apiRequest<BlueprintResponse>(`/blueprints/${blueprintId}`),
+
+  /** POST /api/v1/blueprints/{blueprintId}/generate */
+  generate: (blueprintId: string) =>
+    apiRequest<StartGenerationResponse>(`/blueprints/${blueprintId}/generate`, {
+      method: 'POST',
+    }),
+}
+
+// ── Jobs ─────────────────────────────────────────────────────────
+
+export const jobsApi = {
+  /** GET /api/v1/jobs/{jobId} */
+  get: (jobId: string) =>
+    apiRequest<JobResponse>(`/jobs/${jobId}`),
+}
+
+// ── Exams ─────────────────────────────────────────────────────────
+
+export const examsApi = {
+  /** POST /api/v1/blueprints/{blueprintId}/assemble */
+  assemble: (blueprintId: string, body: AssembleExamRequest) =>
+    apiRequest<Exam>(`/blueprints/${blueprintId}/assemble`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** GET /api/v1/blueprints/{blueprintId}/exams */
+  listByBlueprint: (blueprintId: string) =>
+    apiRequest<ExamListItem[]>(`/blueprints/${blueprintId}/exams`),
+
+  /** GET /api/v1/exams/{examId} */
+  get: (examId: string) =>
+    apiRequest<Exam>(`/exams/${examId}`),
+
+  /** POST /api/v1/exams/{examId}/questions */
+  addQuestion: (examId: string, body: AddExamQuestionRequest) =>
+    apiRequest<ExamQuestion>(`/exams/${examId}/questions`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** PATCH /api/v1/exams/{examId}/questions/reorder */
+  reorder: (examId: string, body: ReorderExamQuestionsRequest) =>
+    apiRequest<Exam>(`/exams/${examId}/questions/reorder`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  /** DELETE /api/v1/exams/{examId}/questions/{examQuestionId} */
+  removeQuestion: (examId: string, examQuestionId: string) =>
+    fetch(
+      `${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/exams/${examId}/questions/${examQuestionId}`,
+      { method: 'DELETE' },
+    ).then(async (res) => {
+      if (!res.ok && res.status !== 204) {
+        const text = await res.text().catch(() => res.statusText)
+        throw new ApiError(res.status, text)
+      }
+    }),
+}
+
+// ── Exports ──────────────────────────────────────────────────
+
+export const exportsApi = {
+  /** POST /api/v1/exams/{examId}/export — trigger generation; returns both records */
+  trigger: (examId: string) =>
+    apiRequest<ExportPairResponse>(`/exams/${examId}/export`, { method: 'POST' }),
+
+  /** GET /api/v1/exams/{examId}/exports — list export records, newest first */
+  listByExam: (examId: string) =>
+    apiRequest<ExportRecord[]>(`/exams/${examId}/exports`),
+
+  /** Construct the download URL (opened via window.open / anchor) */
+  downloadUrl: (exportId: string) =>
+    `${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/exports/${exportId}/download`,
+}
+
+// ── Student Practice ──────────────────────────────────────────
+
+export const practiceApi = {
+  /** POST /api/v1/student/practice-sets */
+  create: (body: CreatePracticeSetRequest) =>
+    apiRequest<PracticeSetResponse>('/student/practice-sets', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** GET /api/v1/student/practice-sets/{questionSetId} */
+  get: (questionSetId: string) =>
+    apiRequest<PracticeSetResponse>(`/student/practice-sets/${questionSetId}`),
 }

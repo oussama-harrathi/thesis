@@ -69,6 +69,12 @@ class Job(Base):
         nullable=True,
         index=True,
     )
+    blueprint_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("exam_blueprints.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # ── Progress tracking ─────────────────────────────────────────
     progress: Mapped[int] = mapped_column(

@@ -29,12 +29,31 @@ class Settings(BaseSettings):
     # ── Redis ────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # ── LLM Provider ─────────────────────────────────────────────
-    LLM_PROVIDER: str = "mock"  # "openai" | "ollama" | "mock"
-    OPENAI_API_KEY: str = ""
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    # ── LLM Provider (──────────────────────────────────────────────
+    # Supported: openai_compatible | gemini | ollama | mock
+    LLM_PROVIDER: str = "mock"
+
+    # ── OpenAI-compatible provider (Groq / OpenRouter / OpenAI) ───────────
+    OPENAI_COMPATIBLE_API_KEY: str = ""
+    OPENAI_COMPATIBLE_BASE_URL: str = "https://api.openai.com/v1"
+    OPENAI_COMPATIBLE_MODEL: str = "gpt-4o-mini"
+    OPENAI_COMPATIBLE_TEMPERATURE: float = 0.3
+    OPENAI_COMPATIBLE_MAX_TOKENS: int = 2048
+    OPENAI_COMPATIBLE_TIMEOUT: float = 60.0
+
+    # ── Gemini provider ──────────────────────────────────────────────
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-1.5-flash"
+    GEMINI_TEMPERATURE: float = 0.3
+    GEMINI_MAX_TOKENS: int = 2048
+    GEMINI_TIMEOUT: float = 60.0
+
+    # ── Ollama provider ──────────────────────────────────────────────
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3"
+    OLLAMA_TEMPERATURE: float = 0.3
+    OLLAMA_MAX_TOKENS: int = 2048
+    OLLAMA_TIMEOUT: float = 120.0   # local models can be slow
 
     # ── Embedding ────────────────────────────────────────────────
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
@@ -47,6 +66,7 @@ class Settings(BaseSettings):
     # ── File Storage ─────────────────────────────────────────────
     UPLOAD_DIR: str = "data/uploads"   # relative to the process cwd (Backend/)
     MAX_UPLOAD_SIZE_MB: int = 50       # hard limit enforced in the route
+    EXPORT_DIR: str = "data/exports"   # export output directory (relative to Backend/)
 
     # ── CORS ─────────────────────────────────────────────────────
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]

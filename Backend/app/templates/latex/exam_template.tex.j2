@@ -1,0 +1,66 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{enumitem}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{parskip}
+\usepackage{amsmath}
+
+\title{<< exam.title | latex_escape >>}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+<% if exam.description %>
+\textit{<< exam.description | latex_escape >>}
+
+\vspace{0.5em}
+<% endif %>
+
+\noindent
+\textbf{Total points:} << exam.total_points if exam.total_points else 'N/A' >>
+\hfill
+\textbf{Number of questions:} << items | length >>
+
+\vspace{1em}
+\hrule
+\vspace{1.5em}
+
+<% for item in items %>
+\noindent
+\textbf{Question << item.position >><% if item.points %> (<< item.points >> pts)<% endif %>.}~
+<< item.question.body | latex_escape >>
+
+<% if item.question.type == 'mcq' %>
+\begin{enumerate}[label=\textbf{\Alph*.}]
+<% for opt in item.question.mcq_options %>
+  \item << opt.text | latex_escape >>
+<% endfor %>
+\end{enumerate}
+<% elif item.question.type == 'true_false' %>
+\begin{enumerate}[label=\textbf{\Alph*.}]
+  \item True
+  \item False
+\end{enumerate}
+<% elif item.question.type == 'short_answer' %>
+\vspace{0.4cm}
+\noindent\makebox[\linewidth]{\hrulefill}
+\vspace{0.6cm}
+<% elif item.question.type == 'essay' %>
+\vspace{0.4cm}
+\noindent\makebox[\linewidth]{\hrulefill}
+\vspace{0.4cm}
+\noindent\makebox[\linewidth]{\hrulefill}
+\vspace{0.4cm}
+\noindent\makebox[\linewidth]{\hrulefill}
+\vspace{0.6cm}
+<% endif %>
+
+<% if not loop.last %>
+\vspace{0.5em}
+<% endif %>
+<% endfor %>
+
+\end{document}

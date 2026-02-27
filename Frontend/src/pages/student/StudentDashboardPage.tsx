@@ -10,10 +10,11 @@ export default function StudentDashboardPage() {
 
       <ul style={styles.list}>
         <li>
+          <Link to="/student/practice/new">🎯 Start a Practice Session</Link>
+        </li>
+        <li>
           <Link to="/courses">📚 Browse Courses</Link>
         </li>
-        <li style={styles.disabled}>🎯 Start Practice Session (Phase 10)</li>
-        <li style={styles.disabled}>📊 Review Answers (Phase 10)</li>
       </ul>
 
       <p>

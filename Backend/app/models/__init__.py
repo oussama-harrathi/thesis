@@ -24,6 +24,8 @@ from app.models.question import (                                       # noqa: 
     QuestionValidation,
 )
 from app.models.job import Job, JobStatus, JobType                      # noqa: F401
+from app.models.exam import ExamBlueprint, Exam, ExamQuestion           # noqa: F401
+from app.models.export import Export, ExportType, ExportStatus          # noqa: F401
 
 __all__ = [
     # core
@@ -49,4 +51,12 @@ __all__ = [
     "Job",
     "JobStatus",
     "JobType",
+    # exam
+    "ExamBlueprint",
+    "Exam",
+    "ExamQuestion",
+    # exports
+    "Export",
+    "ExportType",
+    "ExportStatus",
 ]

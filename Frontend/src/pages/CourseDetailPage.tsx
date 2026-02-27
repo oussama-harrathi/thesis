@@ -45,9 +45,18 @@ export default function CourseDetailPage() {
           Created {new Date(course.created_at).toLocaleDateString()} &nbsp;·&nbsp;
           ID: <code style={s.code}>{course.id}</code>
         </p>
-        <div style={{ marginTop: 12 }}>
+        <div style={{ marginTop: 12, display: 'flex', gap: 20, flexWrap: 'wrap' }}>
           <Link to={`/courses/${course.id}/topics`} style={s.topicsLink}>
             🏷️ Manage Topics →
+          </Link>
+          <Link to={`/courses/${course.id}/blueprints/new`} style={s.topicsLink}>
+            📐 Create Blueprint & Generate →
+          </Link>
+          <Link to={`/courses/${course.id}/questions`} style={s.topicsLink}>
+            📋 Review Questions →
+          </Link>
+          <Link to={`/courses/${course.id}/exam-builder`} style={s.topicsLink}>
+            📝 Exam Builder →
           </Link>
         </div>
       </div>

@@ -20,8 +20,18 @@ class JobResponse(BaseModel):
     status: JobStatus
     document_id: uuid.UUID | None
     course_id: uuid.UUID | None
+    blueprint_id: uuid.UUID | None
     progress: int
     message: str | None
     error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class StartGenerationResponse(BaseModel):
+    """Response returned immediately when a blueprint generation job is dispatched."""
+
+    job_id: uuid.UUID
+    question_set_id: uuid.UUID
+    blueprint_id: uuid.UUID
+    status: JobStatus

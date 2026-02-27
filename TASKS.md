@@ -1,10 +1,5 @@
 # TASKS.md — Thesis MVP Tracker
 
-## Current Focus
-- Phase: 6 — LLM + Retrieval (next)
-- Phase 5 fully complete
-
----
 
 ## Phase 1 — Foundations
 - [x] Create backend FastAPI scaffold
@@ -46,47 +41,49 @@
 - [x] Topics React page (view/add/edit/delete)
 
 ## Phase 6 — LLM + Retrieval
-- [ ] LLM provider base interface
-- [ ] OpenAI-compatible provider
-- [ ] Ollama provider
-- [ ] Mock provider
-- [ ] Prompt files structure
-- [ ] pgvector retrieval service
+- [x] LLM provider base interface
+- [x] OpenAI-compatible provider (for Groq/OpenRouter)
+- [x] Gemini provider
+- [x] Ollama provider (optional local)
+- [x] Mock provider
+- [x] Prompt files structure
+- [x] pgvector retrieval service
 
 ## Phase 7 — Question Generation (MCQ + TF first)
-- [ ] Pydantic schemas for LLM outputs
-- [ ] MCQ generator
-- [ ] True/False generator
-- [ ] Save question_sources
-- [ ] Generation API endpoints
+- [x] Pydantic schemas for LLM outputs
+- [x] MCQ generator
+- [x] True/False generator
+- [x] Save question_sources
+- [x] Generation API endpoints
 
 ## Phase 8 — Quality Controls
-- [ ] Grounding validation
-- [ ] MCQ distractor validation
-- [ ] Difficulty tagging
-- [ ] Bloom tagging
-- [ ] Store validation rows
+- [x] Grounding validation
+- [x] MCQ distractor validation
+- [x] Difficulty tagging
+- [x] Bloom tagging
+- [x] Store validation rows
+- [x] Wire all validators into generation flow
 
 ## Phase 9 — Professor Exam Workflow
-- [ ] Blueprint model + API
-- [ ] Blueprint generation job
-- [ ] Question review page
-- [ ] Approve/reject/edit flow
-- [ ] Exam assembly API + UI
+- [x] Blueprint model + API
+- [x] Blueprint generation job
+- [x] Question review page
+- [x] Approve/reject/edit flow
+- [x] Exam assembly API + UI
 
 ## Phase 10 — Student Practice Workflow
-- [ ] Practice set API
-- [ ] Practice generation flow
-- [ ] Practice UI (answer reveal/explanations)
+- [x] Practice set API
+- [x] Practice generation flow
+- [x] Practice UI (answer reveal/explanations)
 
 ## Phase 11 — Export
-- [ ] LaTeX templates
-- [ ] Export service
-- [ ] PDF compile with fallback
-- [ ] Export download endpoint/UI
+- [x] LaTeX templates
+- [x] Export service
+- [x] PDF compile with fallback
+- [x] Export download endpoint/UI
 
 ## Phase 12 — Testing + Polish
-- [ ] Unit tests for core services
-- [ ] Integration tests (mock provider)
+- [x] Unit tests for core services
+- [x] Integration tests (mock provider)
 - [ ] Demo test run (end-to-end)
 - [ ] Final cleanup

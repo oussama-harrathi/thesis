@@ -163,13 +163,17 @@ Prefer small components and predictable state.
 ## 4.3 AI Provider Abstraction
 Implement LLM provider abstraction:
 - base interface
-- OpenAI-compatible provider
-- Ollama provider
+- OpenAI-compatible provider (for Groq/OpenRouter and similar APIs)
+- Gemini provider (Google Gemini API / AI Studio)
+- Ollama provider (optional local)
 - Mock provider (for tests)
 
 Select provider via environment variables.
 
----
+Important:
+- Do not hardcode OpenAI-specific behavior in the shared abstraction.
+- Groq/OpenRouter should be supported through the OpenAI-compatible adapter.
+- Gemini should use its own adapter because request/response format differs.
 
 ## 5) Grounding and AI Safety Rules (Critical)
 

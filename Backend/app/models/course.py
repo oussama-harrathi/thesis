@@ -19,6 +19,7 @@ from app.core.database import Base
 
 if TYPE_CHECKING:
     from app.models.document import Document
+    from app.models.exam import ExamBlueprint
 
 
 class Course(Base):
@@ -42,6 +43,12 @@ class Course(Base):
     # ── Relationships ─────────────────────────────────────────────
     documents: Mapped[list["Document"]] = relationship(  # noqa: F821
         "Document",
+        back_populates="course",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+    blueprints: Mapped[list["ExamBlueprint"]] = relationship(  # noqa: F821
+        "ExamBlueprint",
         back_populates="course",
         cascade="all, delete-orphan",
         lazy="select",

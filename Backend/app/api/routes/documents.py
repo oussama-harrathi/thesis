@@ -19,6 +19,7 @@ from app.core.database import get_db
 from app.schemas.document import DocumentResponse, DocumentUploadResponse
 from app.services.course_service import CourseService
 from app.services.document_ingestion_service import DocumentIngestionService
+from app.workers.tasks import process_document
 
 router = APIRouter(tags=["documents"])
 
@@ -124,6 +125,9 @@ async def upload_document(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=str(exc),
         )
+
+    # 4. Enqueue the background processing task
+    process_document.delay(str(document.id), str(job.id))
 
     return DocumentUploadResponse(
         document=DocumentResponse.model_validate(document),

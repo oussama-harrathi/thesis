@@ -1,0 +1,66 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{enumitem}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{parskip}
+\usepackage{amsmath}
+\usepackage{xcolor}
+
+\title{<< exam.title | latex_escape >> --- Answer Key}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+{\large \textbf{\textcolor{red}{ANSWER KEY --- Not for Distribution}}}
+
+\vspace{0.5em}
+
+<% if exam.description %>
+\textit{<< exam.description | latex_escape >>}
+
+\vspace{0.5em}
+<% endif %>
+
+\noindent
+\textbf{Total points:} << exam.total_points if exam.total_points else 'N/A' >>
+\hfill
+\textbf{Number of questions:} << items | length >>
+
+\vspace{1em}
+\hrule
+\vspace{1.5em}
+
+<% for item in items %>
+\noindent
+\textbf{Question << item.position >><% if item.points %> (<< item.points >> pts)<% endif %>.}~
+<< item.question.body | latex_escape >>
+
+<% if item.question.type == 'mcq' %>
+\begin{enumerate}[label=\textbf{\Alph*.}]
+<% for opt in item.question.mcq_options %>
+  \item<% if opt.is_correct %> \textbf{\textcolor{teal}{[CORRECT]}} <% endif %> << opt.text | latex_escape >>
+<% endfor %>
+\end{enumerate}
+<% elif item.question.type == 'true_false' %>
+\textbf{Answer:} \textcolor{teal}{<< item.question.correct_answer | latex_escape if item.question.correct_answer else 'N/A' >>}
+<% elif item.question.type == 'short_answer' %>
+\textbf{Model Answer:} \textcolor{teal}{<< item.question.correct_answer | latex_escape if item.question.correct_answer else '---' >>}
+<% elif item.question.type == 'essay' %>
+\textbf{Key Points:} \textcolor{teal}{<< item.question.correct_answer | latex_escape if item.question.correct_answer else 'See explanation.' >>}
+<% endif %>
+
+<% if item.question.explanation %>
+\textit{\small Explanation: << item.question.explanation | latex_escape >>}
+<% endif %>
+
+<% if not loop.last %>
+\vspace{0.8em}
+\noindent\rule{\linewidth}{0.2pt}
+\vspace{0.3em}
+<% endif %>
+<% endfor %>
+
+\end{document}
