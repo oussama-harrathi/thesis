@@ -1,0 +1,41 @@
+# Environment variables - NEVER commit these
+.env
+.env.local
+.env.*.local
+Backend/.env
+Frontend/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+Frontend/dist/
+Frontend/build/
+*.tsbuildinfo
+
+# Alembic
+# (keep versions tracked, ignore compiled/cache)
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Uploads
+Backend/uploads/
+*.pdf
