@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 3000
     CHUNK_OVERLAP: int = 400
 
+    # ── Rate limiting ─────────────────────────────────────────────
+    # Tokens per minute sent to the LLM provider.
+    # Groq free tier = 12 000 TPM; raise for paid tiers or other providers.
+    # Set to 1_000_000 to effectively disable pacing.
+    LLM_TPM_LIMIT: int = 12_000
+
     # ── File Storage ─────────────────────────────────────────────
     UPLOAD_DIR: str = "data/uploads"   # relative to the process cwd (Backend/)
     MAX_UPLOAD_SIZE_MB: int = 50       # hard limit enforced in the route

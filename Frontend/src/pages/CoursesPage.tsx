@@ -1,10 +1,11 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { useCourses, useCreateCourse } from '../hooks/useCourses'
+import { useCourses, useCreateCourse, useDeleteCourse } from '../hooks/useCourses'
 
 export default function CoursesPage() {
   const { data: courses, isLoading, error } = useCourses()
   const createCourse = useCreateCourse()
+  const deleteCourse = useDeleteCourse()
 
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
@@ -83,7 +84,19 @@ export default function CoursesPage() {
                 <p style={s.cardDesc}>{course.description}</p>
               )}
             </div>
-            <Link to={`/courses/${course.id}`} style={s.cardArrow}>→</Link>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Link to={`/courses/${course.id}`} style={s.cardArrow}>→</Link>
+              <button
+                style={s.deleteBtn}
+                disabled={deleteCourse.isPending}
+                onClick={() => {
+                  if (window.confirm(`Delete "${course.name}"?\n\nThis will permanently remove the course and all its documents, topics, questions and exams.`))
+                    deleteCourse.mutate(course.id)
+                }}
+              >
+                Delete
+              </button>
+            </div>
           </li>
         ))}
       </ul>
@@ -116,6 +129,16 @@ const s: Record<string, React.CSSProperties> = {
   cardTitle: { fontWeight: 600, fontSize: '1rem', color: '#5c6ac4', textDecoration: 'none' },
   cardDesc: { margin: 0, fontSize: '0.85rem', color: '#666' },
   cardArrow: { fontSize: '1.2rem', color: '#aaa', textDecoration: 'none' },
+  deleteBtn: {
+    padding: '4px 12px',
+    background: 'transparent',
+    color: '#c0392b',
+    border: '1px solid #e8c4be',
+    borderRadius: 6,
+    cursor: 'pointer',
+    fontWeight: 600,
+    fontSize: '0.82rem',
+  },
   muted: { color: '#888' },
   error: { color: '#c0392b', background: '#fdf0ee', padding: '8px 12px', borderRadius: 6, margin: 0 },
 }

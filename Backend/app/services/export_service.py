@@ -196,6 +196,12 @@ class ExportService:
                 )
 
         await db.flush()
+        # Refresh both objects so all server-set columns (e.g. updated_at) are
+        # loaded while we are still inside the async context.  Without this,
+        # accessing those columns in synchronous helper code causes a
+        # MissingGreenlet error because SQLAlchemy would try to lazy-load them.
+        await db.refresh(exam_export)
+        await db.refresh(answer_key_export)
         return exam_export, answer_key_export
 
     async def list_by_exam(

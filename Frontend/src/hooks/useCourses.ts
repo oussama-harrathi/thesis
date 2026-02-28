@@ -48,3 +48,12 @@ export function useUpdateCourse(courseId: string) {
     },
   })
 }
+
+/** Delete a course; invalidates list on success. */
+export function useDeleteCourse() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (courseId: string) => coursesApi.delete(courseId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: courseKeys.all }),
+  })
+}

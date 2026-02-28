@@ -76,3 +76,21 @@ class CourseService:
         await self._db.refresh(course)
         logger.info("Updated course id=%s fields=%s", course.id, list(patch.keys()))
         return course
+
+    # ── Delete ────────────────────────────────────────────
+
+    async def delete(self, course_id: uuid.UUID) -> bool:
+        """
+        Delete a course and all cascade-related rows (documents, chunks,
+        topics, questions, exams, exports, jobs — all foreign keys are
+        ON DELETE CASCADE in the schema).
+
+        Returns True if the course existed and was deleted, False if not found.
+        """
+        course = await self.get_by_id(course_id)
+        if course is None:
+            return False
+        await self._db.delete(course)
+        await self._db.flush()
+        logger.info("Deleted course id=%s", course_id)
+        return True

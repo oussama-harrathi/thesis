@@ -8,6 +8,19 @@
 import { Link, useParams } from 'react-router-dom'
 import { useJob } from '../../hooks/useJobs'
 import { useCourse } from '../../hooks/useCourses'
+import type { JobSummary } from '../../types/api'
+
+/** Safe parse of job.error — returns null if missing/invalid JSON. */
+function parseJobSummary(raw: string | null | undefined): JobSummary | null {
+  if (!raw) return null
+  try {
+    const obj = JSON.parse(raw)
+    if (typeof obj === 'object' && 'requested' in obj) return obj as JobSummary
+    return null
+  } catch {
+    return null
+  }
+}
 
 const STATUS_LABEL: Record<string, string> = {
   pending:   '⏳ Queued — waiting for a worker to pick it up…',
@@ -31,6 +44,8 @@ export default function GenerationPage() {
   const status = job?.status ?? 'pending'
   const progress = job?.progress ?? 0
   const isDone = status === 'completed' || status === 'failed'
+  const summary = isDone ? parseJobSummary(job?.error) : null
+  const isPartial = summary && summary.failed > 0
 
   return (
     <div style={s.container}>
@@ -69,8 +84,45 @@ export default function GenerationPage() {
             <p style={s.message}>{job.message}</p>
           )}
 
-          {/* Error detail */}
-          {status === 'failed' && job.error && (
+          {/* Generation summary (shown when job finishes) */}
+          {summary && (
+            <div style={isPartial ? s.summaryPartial : s.summaryOk}>
+              <p style={s.summaryTitle}>
+                {isPartial ? '⚠️ Partial Generation' : '✅ All Questions Generated'}
+              </p>
+              <div style={s.summaryGrid}>
+                <div style={s.summaryCell}>
+                  <span style={s.summaryNum}>{summary.requested}</span>
+                  <span style={s.summaryLabel}>Requested</span>
+                </div>
+                <div style={s.summaryCell}>
+                  <span style={{ ...s.summaryNum, color: '#16a34a' }}>{summary.generated}</span>
+                  <span style={s.summaryLabel}>Generated</span>
+                </div>
+                <div style={s.summaryCell}>
+                  <span style={{ ...s.summaryNum, color: summary.failed > 0 ? '#dc2626' : '#555' }}>
+                    {summary.failed}
+                  </span>
+                  <span style={s.summaryLabel}>Failed</span>
+                </div>
+              </div>
+              {summary.failure_reasons.length > 0 && (
+                <details style={{ marginTop: 12 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: '0.82rem', color: '#666' }}>
+                    Show failure reasons ({summary.failure_reasons.length})
+                  </summary>
+                  <ul style={s.reasonsList}>
+                    {summary.failure_reasons.map((r, i) => (
+                      <li key={i} style={s.reasonItem}>{r}</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+            </div>
+          )}
+
+          {/* Raw error fallback (for non-summary failures) */}
+          {status === 'failed' && !summary && job.error && (
             <p style={s.error}>Error: {job.error}</p>
           )}
 
@@ -125,4 +177,13 @@ const s: Record<string, React.CSSProperties> = {
   ctaBox: { marginTop: 24, padding: '16px 20px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8 },
   btnReview: { display: 'inline-block', padding: '10px 22px', background: '#5c6ac4', color: '#fff', textDecoration: 'none', borderRadius: 6, fontWeight: 700 },
   btnRetry: { display: 'inline-block', padding: '10px 22px', background: '#f0f0f0', color: '#333', textDecoration: 'none', borderRadius: 6, fontWeight: 600 },
+  summaryOk: { marginTop: 20, padding: '14px 18px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8 },
+  summaryPartial: { marginTop: 20, padding: '14px 18px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8 },
+  summaryTitle: { margin: '0 0 12px', fontWeight: 700, fontSize: '0.95rem' },
+  summaryGrid: { display: 'flex', gap: 24 },
+  summaryCell: { display: 'flex', flexDirection: 'column', alignItems: 'center' },
+  summaryNum: { fontSize: '1.6rem', fontWeight: 800, lineHeight: 1 },
+  summaryLabel: { fontSize: '0.75rem', color: '#666', marginTop: 4, textTransform: 'uppercase' as const, letterSpacing: '0.05em' },
+  reasonsList: { margin: '8px 0 0', paddingLeft: 18, fontSize: '0.82rem', color: '#555', lineHeight: 1.6 },
+  reasonItem: { marginBottom: 2 },
 }

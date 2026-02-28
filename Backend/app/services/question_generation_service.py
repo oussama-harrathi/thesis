@@ -35,6 +35,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.llm.base import BaseLLMProvider, GenerationSettings
 from app.llm.factory import get_llm_provider
 from app.llm.prompts.mcq_generation import MCQ_GENERATION_SYSTEM, MCQ_GENERATION_USER
+from app.llm.prompts.short_answer_generation import (
+    SHORT_ANSWER_GENERATION_SYSTEM,
+    SHORT_ANSWER_GENERATION_USER,
+)
 from app.llm.prompts.tf_generation import TF_GENERATION_SYSTEM, TF_GENERATION_USER
 from app.models.question import (
     Difficulty,
@@ -47,17 +51,23 @@ from app.models.question import (
 from app.schemas.llm_outputs import (
     MCQGenerationOutput,
     MCQQuestionOutput,
+    ShortAnswerGenerationOutput,
+    ShortAnswerQuestionOutput,
     TrueFalseGenerationOutput,
     TFQuestionOutput,
 )
-from app.services.retrieval_service import RetrievalService, RetrievedChunk
-from app.services.validation_service import ValidationService
+from app.services.context_builder import ContextBuilder
+from app.services.retrieval_service import MIN_CONTEXT_CHUNKS, RetrievalService, RetrievedChunk
+from app.services.validation_service import CorrectnessResult, ValidationService
+from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_duplicate_question, should_reject_trivial
+from app.utils.text_normalization import normalize_logic_symbols
 
 logger = logging.getLogger(__name__)
 
 # Bump these strings whenever the corresponding prompt templates change.
-MCQ_PROMPT_VERSION = "mcq-v1"
-TF_PROMPT_VERSION = "tf-v1"
+MCQ_PROMPT_VERSION = "mcq-v3"
+TF_PROMPT_VERSION = "tf-v3"
+SA_PROMPT_VERSION = "sa-v2"
 
 
 class QuestionGenerationService:
@@ -95,6 +105,10 @@ class QuestionGenerationService:
         top_k_chunks: int = 6,
         retrieval_query: str | None = None,
         generation_settings: GenerationSettings | None = None,
+        exclude_chunk_ids: set[uuid.UUID] | None = None,
+        _out_chunk_ids: list[uuid.UUID] | None = None,
+        used_question_stems: list[str] | None = None,
+        target_bloom: str | None = None,
     ) -> list[Question]:
         """
         Generate *count* MCQ question(s) grounded in the course material.
@@ -115,10 +129,10 @@ class QuestionGenerationService:
 
         Returns
         -------
-        List of persisted Question objects (may be shorter than *count* if
-        the LLM signals insufficient context).
+        List of persisted Question objects (may be empty if context is
+        insufficient or grounding validation fails).
         """
-        # ── 1. Retrieve context chunks ─────────────────────────────────
+        # ── 1. Retrieve context chunks (with course scoping + fallback) ───
         query = retrieval_query or topic_name
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
@@ -127,39 +141,42 @@ class QuestionGenerationService:
             course_id=course_id,
             top_k=top_k_chunks,
             min_score=0.1,
+            exclude_chunk_ids=exclude_chunk_ids,
         )
+
+        logger.info(
+            "generate_mcq: retrieved %d chunks for course=%s topic=%r topic_id=%s "
+            "(min_required=%d) context_chars=%d",
+            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            sum(len(c.content) for c in chunks),
+        )
+
+        if _out_chunk_ids is not None:
+            _out_chunk_ids.extend(c.chunk_id for c in chunks)
 
         if not chunks:
             logger.warning(
-                "generate_mcq: no chunks retrieved for course=%s topic=%s — skipping",
-                course_id,
-                topic_id,
+                "generate_mcq: SKIP — 0 chunks after fallback for course=%s topic=%r",
+                course_id, topic_name,
             )
             return []
 
-        logger.debug(
-            "generate_mcq: retrieved %d chunks for course=%s topic=%s",
-            len(chunks),
-            course_id,
-            topic_id,
-        )
-
-        # ── 2. Build grounded prompt ───────────────────────────────────
-        context_text = self._format_context(chunks)
+        # ── 2. Build compact, token-efficient context ──────────────────────
+        bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        context_text = ContextBuilder.build(chunks)
         prompt = self._build_mcq_prompt(
             context=context_text,
             topic=topic_name,
             difficulty=difficulty,
             count=count,
+            target_bloom=bloom,
         )
 
         # ── 3. Call LLM ────────────────────────────────────────────────
         logger.info(
-            "generate_mcq: calling LLM provider=%s count=%d topic=%r difficulty=%s",
-            self._provider.provider_name,
-            count,
-            topic_name,
-            difficulty,
+            "generate_mcq: calling LLM provider=%s count=%d topic=%r difficulty=%s "
+            "context_chunks=%d",
+            self._provider.provider_name, count, topic_name, difficulty, len(chunks),
         )
         try:
             output: MCQGenerationOutput = await self._provider.generate_json(
@@ -169,35 +186,102 @@ class QuestionGenerationService:
             )
         except Exception as exc:
             logger.error(
-                "generate_mcq: LLM call failed for course=%s topic=%s: %s",
-                course_id,
-                topic_id,
-                exc,
-                exc_info=True,
+                "generate_mcq: LLM call failed for course=%s topic=%r: %s",
+                course_id, topic_name, exc, exc_info=True,
             )
             return []
 
-        # ── 4. Handle insufficient context ────────────────────────────
-        if output.insufficient_context and not output.questions:
-            logger.warning(
-                "generate_mcq: LLM returned insufficient_context=True and "
-                "no questions for course=%s topic=%r",
-                course_id,
-                topic_name,
-            )
-            return []
-
+        # ── 4. Hard grounding gate ─────────────────────────────────────
+        # If the LLM flagged insufficient context, discard all returned questions.
+        # They were likely hallucinated from external knowledge.
         if output.insufficient_context:
             logger.warning(
-                "generate_mcq: LLM flagged insufficient_context=True but "
-                "returned %d question(s) — saving partial results",
-                len(output.questions),
-                extra={"course_id": str(course_id), "topic": topic_name},
+                "generate_mcq: LLM returned insufficient_context=True for "
+                "course=%s topic=%r — discarding %d question(s) to prevent hallucination",
+                course_id, topic_name, len(output.questions),
             )
+            return []
+
+        if not output.questions:
+            logger.warning(
+                "generate_mcq: LLM returned 0 questions (no insufficient_context flag) "
+                "for course=%s topic=%r",
+                course_id, topic_name,
+            )
+            return []
 
         # ── 5–7. Persist questions + options + sources ─────────────────
         saved: list[Question] = []
         for q_output in output.questions:
+            # B) Normalize math/logic symbol artifacts in all text fields.
+            q_output = q_output.model_copy(update={
+                "stem": normalize_logic_symbols(q_output.stem),
+                "options": [
+                    opt.model_copy(update={"text": normalize_logic_symbols(opt.text)})
+                    for opt in q_output.options
+                ],
+                "explanation": (
+                    normalize_logic_symbols(q_output.explanation)
+                    if q_output.explanation else None
+                ),
+            })
+
+            # Validate MCQ structure before persisting.
+            if not self._validate_mcq_structure(q_output):
+                logger.warning(
+                    "generate_mcq: invalid MCQ structure (stem=%r) — skipping",
+                    q_output.stem[:80],
+                )
+                continue
+            # Duplicate detection across the current generation job.
+            if used_question_stems is not None:
+                is_dup, sim = is_duplicate_question(q_output.stem, used_question_stems)
+                if is_dup:
+                    logger.warning(
+                        "generate_mcq: DUPLICATE detected (sim=%.2f) stem=%r — skipping",
+                        sim, q_output.stem[:80],
+                    )
+                    continue
+            # Triviality guard: skip trivial stems for medium/hard slots.
+            if should_reject_trivial(q_output.stem, difficulty, bloom):
+                logger.warning(
+                    "generate_mcq: TRIVIAL stem for %s/%s — skipping stem=%r",
+                    difficulty, bloom, q_output.stem[:80],
+                )
+                continue
+
+            # A) Pre-persist MCQ correctness verification.
+            mcq_correctness: CorrectnessResult | None = None
+            try:
+                options_fmt = "\n".join(
+                    f"  {opt.key}. {opt.text}"
+                    + ("  \u2190 marked correct" if opt.is_correct else "")
+                    for opt in q_output.options
+                )
+                claimed_key = next(
+                    (opt.key for opt in q_output.options if opt.is_correct), "?"
+                )
+                mcq_correctness = await self._validation_svc.verify_mcq_correctness(
+                    stem=q_output.stem,
+                    options_text=options_fmt,
+                    claimed_correct=claimed_key,
+                    context_text=context_text,
+                    provider=self._provider,
+                )
+                if mcq_correctness.should_reject:
+                    logger.warning(
+                        "generate_mcq: CORRECTNESS FAIL — rejecting stem=%r "
+                        "(verdict=%s confidence=%.2f)",
+                        q_output.stem[:80],
+                        mcq_correctness.verdict.value,
+                        mcq_correctness.confidence,
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "generate_mcq: correctness check error — proceeding: %s", exc
+                )
+
             try:
                 question = await self._persist_mcq_question(
                     db,
@@ -205,27 +289,72 @@ class QuestionGenerationService:
                     question_set_id=question_set_id,
                     difficulty=difficulty,
                     chunks=chunks,
-                    insufficient_context=output.insufficient_context,
+                    insufficient_context=False,
                 )
                 saved.append(question)
-                await self._run_validators(db, question, is_mcq=True)
+                if used_question_stems is not None:
+                    used_question_stems.append(q_output.stem)
+                await self._run_validators(
+                    db, question, is_mcq=True,
+                    target_difficulty=difficulty, target_bloom=bloom,
+                    correctness_result=mcq_correctness,
+                )
             except Exception as exc:
                 # One bad question should not abort the whole batch.
                 logger.error(
                     "generate_mcq: failed to persist question (stem=%r): %s",
-                    q_output.stem[:60],
-                    exc,
-                    exc_info=True,
+                    q_output.stem[:60], exc, exc_info=True,
                 )
                 continue
 
         logger.info(
-            "generate_mcq: saved %d/%d MCQ question(s) for course=%s",
-            len(saved),
-            len(output.questions),
-            course_id,
+            "generate_mcq: saved %d/%d MCQ question(s) for course=%s topic=%r",
+            len(saved), len(output.questions), course_id, topic_name,
         )
         return saved
+
+    # ------------------------------------------------------------------ #
+    # Structure validators (pre-persist)                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _validate_mcq_structure(q_output: "MCQQuestionOutput") -> bool:
+        """
+        Return False (and log a warning) if the MCQ output is structurally invalid.
+
+        Checks:
+        - Exactly 4 options present.
+        - Option keys are exactly {A, B, C, D} (no repeats).
+        - Exactly one option has is_correct=True.
+        - Stem is non-empty.
+        """
+        if not q_output.stem or not q_output.stem.strip():
+            logger.warning("_validate_mcq_structure: empty stem")
+            return False
+
+        if len(q_output.options) != 4:
+            logger.warning(
+                "_validate_mcq_structure: expected 4 options, got %d",
+                len(q_output.options),
+            )
+            return False
+
+        keys = {opt.key for opt in q_output.options}
+        if keys != {"A", "B", "C", "D"}:
+            logger.warning(
+                "_validate_mcq_structure: option keys %s ≠ {A,B,C,D}", keys
+            )
+            return False
+
+        correct_count = sum(1 for opt in q_output.options if opt.is_correct)
+        if correct_count != 1:
+            logger.warning(
+                "_validate_mcq_structure: expected 1 correct option, got %d",
+                correct_count,
+            )
+            return False
+
+        return True
 
     # ------------------------------------------------------------------ #
     # Post-generation validators                                           #
@@ -237,12 +366,12 @@ class QuestionGenerationService:
         question: Question,
         *,
         is_mcq: bool,
+        target_difficulty: str = "medium",
+        target_bloom: str = "apply",
+        correctness_result: CorrectnessResult | None = None,
     ) -> None:
         """
         Run all quality-control validators against *question* in sequence.
-
-        Each validator is individually try/excepted so that a failure in one
-        does not prevent the remaining validators from running.
 
         Validators applied
         ------------------
@@ -250,6 +379,8 @@ class QuestionGenerationService:
           2. mcq_distractors — MCQ only
           3. difficulty     — all question types (heuristic + optional LLM)
           4. bloom          — all question types (heuristic + optional LLM)
+          5. triviality     — all question types (heuristic; WARN/FAIL)
+          6. correctness    — MCQ + TF (persists pre-computed LLM verification result)
         """
         # 1. Grounding — every question type
         try:
@@ -296,6 +427,33 @@ class QuestionGenerationService:
                 exc,
             )
 
+        # 5. Triviality check
+        try:
+            await self._validation_svc.validate_triviality(
+                db, question,
+                target_difficulty=target_difficulty,
+                target_bloom=target_bloom,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_run_validators: triviality check failed for question=%s: %s",
+                question.id, exc,
+            )
+
+        # 6. Correctness — persist a pre-computed CorrectnessResult when provided.
+        #    The actual LLM verification ran before persistence so we only write
+        #    the stored result here (no extra LLM call at this stage).
+        if correctness_result is not None:
+            try:
+                await self._validation_svc.persist_correctness_result(
+                    db, question.id, correctness_result
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_run_validators: correctness persist failed for question=%s: %s",
+                    question.id, exc,
+                )
+
     # ------------------------------------------------------------------ #
     # True/False Generation                                                #
     # ------------------------------------------------------------------ #
@@ -313,6 +471,10 @@ class QuestionGenerationService:
         top_k_chunks: int = 6,
         retrieval_query: str | None = None,
         generation_settings: GenerationSettings | None = None,
+        exclude_chunk_ids: set[uuid.UUID] | None = None,
+        _out_chunk_ids: list[uuid.UUID] | None = None,
+        used_question_stems: list[str] | None = None,
+        target_bloom: str | None = None,
     ) -> list[Question]:
         """
         Generate *count* True/False question(s) grounded in the course material.
@@ -321,8 +483,207 @@ class QuestionGenerationService:
 
         Returns
         -------
-        List of persisted Question objects (may be shorter than *count* if
-        the LLM signals insufficient context).
+        List of persisted Question objects (may be empty if context is
+        insufficient or grounding validation fails).
+        """
+        # ── 1. Retrieve context chunks (with course scoping + fallback) ───
+        query = retrieval_query or topic_name
+        chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
+            db,
+            query=query,
+            topic_id=topic_id,
+            course_id=course_id,
+            top_k=top_k_chunks,
+            min_score=0.1,
+            exclude_chunk_ids=exclude_chunk_ids,
+        )
+
+        logger.info(
+            "generate_true_false: retrieved %d chunks for course=%s topic=%r topic_id=%s "
+            "(min_required=%d) context_chars=%d",
+            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            sum(len(c.content) for c in chunks),
+        )
+
+        if _out_chunk_ids is not None:
+            _out_chunk_ids.extend(c.chunk_id for c in chunks)
+
+        if not chunks:
+            logger.warning(
+                "generate_true_false: SKIP — 0 chunks after fallback for course=%s topic=%r",
+                course_id, topic_name,
+            )
+            return []
+
+        # ── 2. Build compact, token-efficient context ──────────────────────
+        bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        context_text = ContextBuilder.build(chunks)
+        prompt = self._build_tf_prompt(
+            context=context_text,
+            topic=topic_name,
+            difficulty=difficulty,
+            count=count,
+            target_bloom=bloom,
+        )
+
+        # ── 3. Call LLM ────────────────────────────────────────────────
+        logger.info(
+            "generate_true_false: calling LLM provider=%s count=%d topic=%r difficulty=%s "
+            "context_chunks=%d",
+            self._provider.provider_name, count, topic_name, difficulty, len(chunks),
+        )
+        try:
+            output: TrueFalseGenerationOutput = await self._provider.generate_json(
+                prompt,
+                TrueFalseGenerationOutput,
+                generation_settings,
+            )
+        except Exception as exc:
+            logger.error(
+                "generate_true_false: LLM call failed for course=%s topic=%r: %s",
+                course_id, topic_name, exc, exc_info=True,
+            )
+            return []
+
+        # ── 4. Hard grounding gate ─────────────────────────────────────
+        if output.insufficient_context:
+            logger.warning(
+                "generate_true_false: LLM returned insufficient_context=True for "
+                "course=%s topic=%r — discarding %d question(s) to prevent hallucination",
+                course_id, topic_name, len(output.questions),
+            )
+            return []
+
+        if not output.questions:
+            logger.warning(
+                "generate_true_false: LLM returned 0 questions for course=%s topic=%r",
+                course_id, topic_name,
+            )
+            return []
+
+        # ── 5–6. Persist questions + sources (no options for TF) ───────
+        saved: list[Question] = []
+        for q_output in output.questions:
+            # B) Normalize math/logic symbol artifacts.
+            q_output = q_output.model_copy(update={
+                "statement": normalize_logic_symbols(q_output.statement),
+                "explanation": (
+                    normalize_logic_symbols(q_output.explanation)
+                    if q_output.explanation else None
+                ),
+            })
+
+            # Duplicate detection
+            if used_question_stems is not None:
+                is_dup, sim = is_duplicate_question(q_output.statement, used_question_stems)
+                if is_dup:
+                    logger.warning(
+                        "generate_true_false: DUPLICATE detected (sim=%.2f) statement=%r — skipping",
+                        sim, q_output.statement[:80],
+                    )
+                    continue
+            # Triviality guard
+            if should_reject_trivial(q_output.statement, difficulty, bloom):
+                logger.warning(
+                    "generate_true_false: TRIVIAL for %s/%s — skipping statement=%r",
+                    difficulty, bloom, q_output.statement[:80],
+                )
+                continue
+
+            # A) Pre-persist TF correctness verification.
+            tf_correctness: CorrectnessResult | None = None
+            try:
+                tf_correctness = await self._validation_svc.verify_tf_correctness(
+                    statement=q_output.statement,
+                    is_true=q_output.is_true,
+                    context_text=context_text,
+                    provider=self._provider,
+                )
+                if tf_correctness.should_reject:
+                    logger.warning(
+                        "generate_true_false: CORRECTNESS FAIL — rejecting statement=%r "
+                        "(verdict=%s confidence=%.2f)",
+                        q_output.statement[:80],
+                        tf_correctness.verdict.value,
+                        tf_correctness.confidence,
+                    )
+                    continue
+                if tf_correctness.should_flip and tf_correctness.correct_is_true is not None:
+                    logger.info(
+                        "generate_true_false: FLIP label %s\u2192%s for statement=%r",
+                        q_output.is_true, tf_correctness.correct_is_true,
+                        q_output.statement[:60],
+                    )
+                    q_output = q_output.model_copy(
+                        update={"is_true": tf_correctness.correct_is_true}
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "generate_true_false: correctness check error — proceeding: %s", exc
+                )
+
+            try:
+                question = await self._persist_tf_question(
+                    db,
+                    q_output=q_output,
+                    question_set_id=question_set_id,
+                    difficulty=difficulty,
+                    chunks=chunks,
+                    insufficient_context=False,
+                )
+                saved.append(question)
+                if used_question_stems is not None:
+                    used_question_stems.append(q_output.statement)
+                await self._run_validators(
+                    db, question, is_mcq=False,
+                    target_difficulty=difficulty, target_bloom=bloom,
+                    correctness_result=tf_correctness,
+                )
+            except Exception as exc:
+                logger.error(
+                    "generate_true_false: failed to persist question (statement=%r): %s",
+                    q_output.statement[:60], exc, exc_info=True,
+                )
+                continue
+
+        logger.info(
+            "generate_true_false: saved %d/%d TF question(s) for course=%s topic=%r",
+            len(saved), len(output.questions), course_id, topic_name,
+        )
+        return saved
+
+    # ------------------------------------------------------------------ #
+    # Short Answer Generation                                              #
+    # ------------------------------------------------------------------ #
+
+    async def generate_short_answer(
+        self,
+        db: AsyncSession,
+        *,
+        question_set_id: uuid.UUID,
+        course_id: uuid.UUID,
+        topic_id: uuid.UUID | None = None,
+        topic_name: str = "General",
+        difficulty: str = "medium",
+        count: int = 1,
+        top_k_chunks: int = 6,
+        retrieval_query: str | None = None,
+        generation_settings: GenerationSettings | None = None,
+        exclude_chunk_ids: set[uuid.UUID] | None = None,
+        _out_chunk_ids: list[uuid.UUID] | None = None,
+        used_question_stems: list[str] | None = None,
+        target_bloom: str | None = None,
+    ) -> list[Question]:
+        """
+        Generate *count* Short Answer question(s) grounded in the course material.
+
+        Each question has a ``body`` (the question text), a ``correct_answer``
+        (model answer), and an ``explanation`` (key grading points joined).
+
+        Returns
+        -------
+        List of persisted Question objects (may be empty if context is
+        insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks ─────────────────────────────────
         query = retrieval_query or topic_name
@@ -333,102 +694,139 @@ class QuestionGenerationService:
             course_id=course_id,
             top_k=top_k_chunks,
             min_score=0.1,
+            exclude_chunk_ids=exclude_chunk_ids,
         )
+
+        logger.info(
+            "generate_short_answer: retrieved %d chunks for course=%s topic=%r "
+            "topic_id=%s (min_required=%d) context_chars=%d",
+            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            sum(len(c.content) for c in chunks),
+        )
+
+        if _out_chunk_ids is not None:
+            _out_chunk_ids.extend(c.chunk_id for c in chunks)
 
         if not chunks:
             logger.warning(
-                "generate_true_false: no chunks retrieved for course=%s topic=%s — skipping",
-                course_id,
-                topic_id,
+                "generate_short_answer: SKIP — 0 chunks after fallback for "
+                "course=%s topic=%r",
+                course_id, topic_name,
             )
             return []
 
-        logger.debug(
-            "generate_true_false: retrieved %d chunks for course=%s topic=%s",
-            len(chunks),
-            course_id,
-            topic_id,
-        )
-
-        # ── 2. Build grounded prompt ───────────────────────────────────
-        context_text = self._format_context(chunks)
-        prompt = self._build_tf_prompt(
+        # ── 2. Build compact context ───────────────────────────────────
+        bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        context_text = ContextBuilder.build(chunks)
+        non_trivial_block = self._build_non_triviality_block(difficulty, bloom)
+        user_section = SHORT_ANSWER_GENERATION_USER.format(
             context=context_text,
             topic=topic_name,
             difficulty=difficulty,
             count=count,
+            target_bloom=bloom,
+            non_triviality_block=non_trivial_block,
         )
+        prompt = f"{SHORT_ANSWER_GENERATION_SYSTEM}\n---\n{user_section}"
 
         # ── 3. Call LLM ────────────────────────────────────────────────
         logger.info(
-            "generate_true_false: calling LLM provider=%s count=%d topic=%r difficulty=%s",
-            self._provider.provider_name,
-            count,
-            topic_name,
-            difficulty,
+            "generate_short_answer: calling LLM provider=%s count=%d topic=%r "
+            "difficulty=%s context_chunks=%d",
+            self._provider.provider_name, count, topic_name, difficulty, len(chunks),
         )
         try:
-            output: TrueFalseGenerationOutput = await self._provider.generate_json(
+            output: ShortAnswerGenerationOutput = await self._provider.generate_json(
                 prompt,
-                TrueFalseGenerationOutput,
+                ShortAnswerGenerationOutput,
                 generation_settings,
             )
         except Exception as exc:
             logger.error(
-                "generate_true_false: LLM call failed for course=%s topic=%s: %s",
-                course_id,
-                topic_id,
-                exc,
-                exc_info=True,
+                "generate_short_answer: LLM call failed for course=%s topic=%r: %s",
+                course_id, topic_name, exc, exc_info=True,
             )
             return []
 
-        # ── 4. Handle insufficient context ────────────────────────────
-        if output.insufficient_context and not output.questions:
-            logger.warning(
-                "generate_true_false: LLM returned insufficient_context=True and "
-                "no questions for course=%s topic=%r",
-                course_id,
-                topic_name,
-            )
-            return []
-
+        # ── 4. Hard grounding gate ─────────────────────────────────────
         if output.insufficient_context:
             logger.warning(
-                "generate_true_false: LLM flagged insufficient_context=True but "
-                "returned %d question(s) — saving partial results",
-                len(output.questions),
-                extra={"course_id": str(course_id), "topic": topic_name},
+                "generate_short_answer: LLM returned insufficient_context=True for "
+                "course=%s topic=%r — discarding %d question(s) to prevent hallucination",
+                course_id, topic_name, len(output.questions),
             )
+            return []
 
-        # ── 5–6. Persist questions + sources (no options for TF) ───────
+        if not output.questions:
+            logger.warning(
+                "generate_short_answer: LLM returned 0 questions for "
+                "course=%s topic=%r",
+                course_id, topic_name,
+            )
+            return []
+
+        # ── 5. Persist questions + sources ─────────────────────────────
         saved: list[Question] = []
         for q_output in output.questions:
+            # B) Normalize math/logic symbol artifacts.
+            q_output = q_output.model_copy(update={
+                "question":     normalize_logic_symbols(q_output.question or ""),
+                "model_answer": normalize_logic_symbols(q_output.model_answer or ""),
+                "key_points": [
+                    normalize_logic_symbols(kp) for kp in (q_output.key_points or [])
+                ],
+            })
+
+            if not q_output.question or not q_output.question.strip():
+                logger.warning(
+                    "generate_short_answer: empty question text — skipping"
+                )
+                continue
+            if not q_output.model_answer or not q_output.model_answer.strip():
+                logger.warning(
+                    "generate_short_answer: empty model_answer — skipping"
+                )
+                continue
+            # Duplicate detection
+            if used_question_stems is not None:
+                is_dup, sim = is_duplicate_question(q_output.question, used_question_stems)
+                if is_dup:
+                    logger.warning(
+                        "generate_short_answer: DUPLICATE detected (sim=%.2f) q=%r — skipping",
+                        sim, q_output.question[:80],
+                    )
+                    continue
+            # Triviality guard
+            if should_reject_trivial(q_output.question, difficulty, bloom):
+                logger.warning(
+                    "generate_short_answer: TRIVIAL for %s/%s — skipping q=%r",
+                    difficulty, bloom, q_output.question[:80],
+                )
+                continue
             try:
-                question = await self._persist_tf_question(
+                question = await self._persist_sa_question(
                     db,
                     q_output=q_output,
                     question_set_id=question_set_id,
                     difficulty=difficulty,
                     chunks=chunks,
-                    insufficient_context=output.insufficient_context,
                 )
                 saved.append(question)
-                await self._run_validators(db, question, is_mcq=False)
+                if used_question_stems is not None:
+                    used_question_stems.append(q_output.question)
+                await self._run_validators(db, question, is_mcq=False,
+                                           target_difficulty=difficulty, target_bloom=bloom)
             except Exception as exc:
                 logger.error(
-                    "generate_true_false: failed to persist question (statement=%r): %s",
-                    q_output.statement[:60],
-                    exc,
-                    exc_info=True,
+                    "generate_short_answer: failed to persist question=%r: %s",
+                    q_output.question[:60], exc, exc_info=True,
                 )
                 continue
 
         logger.info(
-            "generate_true_false: saved %d/%d TF question(s) for course=%s",
-            len(saved),
-            len(output.questions),
-            course_id,
+            "generate_short_answer: saved %d/%d SA question(s) for "
+            "course=%s topic=%r",
+            len(saved), len(output.questions), course_id, topic_name,
         )
         return saved
 
@@ -563,6 +961,64 @@ class QuestionGenerationService:
 
         return question
 
+    async def _persist_sa_question(
+        self,
+        db: AsyncSession,
+        *,
+        q_output: ShortAnswerQuestionOutput,
+        question_set_id: uuid.UUID,
+        difficulty: str,
+        chunks: list[RetrievedChunk],
+    ) -> Question:
+        """
+        Insert one Short Answer Question row and its QuestionSource rows.
+
+        Storage conventions:
+          body           — the question text shown to the student
+          correct_answer — the model answer (1–3 sentences)
+          explanation    — key grading points joined with "; "
+        """
+        try:
+            difficulty_enum = Difficulty(difficulty.lower())
+        except ValueError:
+            logger.warning(
+                "_persist_sa_question: unknown difficulty %r, defaulting to medium",
+                difficulty,
+            )
+            difficulty_enum = Difficulty.medium
+
+        # Join key_points list into a readable grading rubric string.
+        explanation = (
+            "; ".join(q_output.key_points)
+            if q_output.key_points
+            else None
+        )
+
+        question = Question(
+            id=uuid.uuid4(),
+            question_set_id=question_set_id,
+            type=QuestionType.short_answer,
+            body=q_output.question,
+            correct_answer=q_output.model_answer,
+            explanation=explanation,
+            difficulty=difficulty_enum,
+            status=QuestionStatus.draft,
+            model_name=self._provider.provider_name,
+            prompt_version=SA_PROMPT_VERSION,
+            insufficient_context=False,
+        )
+        db.add(question)
+        await db.flush()
+
+        await self._persist_sources(
+            db,
+            question=question,
+            source_hint=q_output.source_hint,
+            chunks=chunks,
+        )
+
+        return question
+
     async def _persist_sources(
         self,
         db: AsyncSession,
@@ -622,22 +1078,83 @@ class QuestionGenerationService:
         return "\n\n".join(parts)
 
     @staticmethod
+    def _derive_bloom_target(difficulty: str) -> str:
+        """Return the default Bloom target for *difficulty*."""
+        return DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+
+    @staticmethod
+    def _build_non_triviality_block(difficulty: str, bloom: str) -> str:
+        """
+        Return an instruction paragraph injected into the prompt instructing the
+        model to avoid trivial recall questions.
+
+        Returns an empty string for EASY/REMEMBER slots so the prompt is not
+        cluttered with unnecessary constraints for straightforward recall.
+        """
+        if difficulty.lower() == "easy" or bloom.lower() == "remember":
+            return ""
+        bloom_verbs: dict[str, str] = {
+            "understand": "explain in their own words or give a concrete example,",
+            "apply":     "apply a rule, procedure, or theorem to a new scenario,",
+            "analyze":   "analyse relationships, identify implicit properties, or compare cases,",
+            "evaluate":  "evaluate or critique a claim using criteria from the material,",
+            "create":    "synthesise or construct a new artifact/proof from provided building blocks,",
+        }
+        task_desc = bloom_verbs.get(bloom.lower(), "reason and apply knowledge from the context,")
+        return (
+            f"Non-triviality requirement (difficulty={difficulty.upper()}, "
+            f"bloom={bloom.upper()}):\n"
+            f"  - Do NOT ask 'What is X?', 'Define X', or 'What does X mean?'.\n"
+            f"  - The question MUST require the student to {task_desc}\n"
+            f"  - Include a concrete cognitive task: evaluate a claim, apply a theorem,\n"
+            f"    identify an error, determine which property holds, or reason from premises.\n"
+            f"  - If you can only produce a trivial definition question from the context,\n"
+            f"    set insufficient_context to true instead."
+        )
+
+    @staticmethod
+    def _build_mcq_stem_hints(difficulty: str) -> str:
+        """
+        Return MCQ stem type suggestions for MEDIUM/HARD slots so the model
+        gravitates towards application-style questions.
+        """
+        if difficulty.lower() == "easy":
+            return ""
+        return (
+            "Preferred MCQ stem patterns for this difficulty:\n"
+            "  \u2022 \"Which of the following is equivalent to …?\"\n"
+            "  \u2022 \"Which statement must be true given …?\"\n"
+            "  \u2022 \"Which inference is valid/invalid and why?\"\n"
+            "  \u2022 \"Which property does X satisfy according to the material?\"\n"
+            "  \u2022 \"What is the next step in this proof/computation?\"\n"
+            "  \u2022 \"Which of the following correctly applies … to this case?\""
+        )
+
+    @staticmethod
     def _build_mcq_prompt(
         *,
         context: str,
         topic: str,
         difficulty: str,
         count: int,
+        target_bloom: str = "apply",
     ) -> str:
         """
         Combine the MCQ system message and formatted user message into a
         single prompt string accepted by BaseLLMProvider.generate_json().
         """
+        non_trivial_block = QuestionGenerationService._build_non_triviality_block(
+            difficulty, target_bloom
+        )
+        stem_hints = QuestionGenerationService._build_mcq_stem_hints(difficulty)
         user_section = MCQ_GENERATION_USER.format(
             context=context,
             topic=topic,
             difficulty=difficulty,
             count=count,
+            target_bloom=target_bloom,
+            non_triviality_block=non_trivial_block,
+            stem_type_hints=stem_hints,
         )
         return f"{MCQ_GENERATION_SYSTEM}\n---\n{user_section}"
 
@@ -648,12 +1165,18 @@ class QuestionGenerationService:
         topic: str,
         difficulty: str,
         count: int,
+        target_bloom: str = "apply",
     ) -> str:
         """Combine the TF system + user messages into a single prompt string."""
+        non_trivial_block = QuestionGenerationService._build_non_triviality_block(
+            difficulty, target_bloom
+        )
         user_section = TF_GENERATION_USER.format(
             context=context,
             topic=topic,
             difficulty=difficulty,
             count=count,
+            target_bloom=target_bloom,
+            non_triviality_block=non_trivial_block,
         )
         return f"{TF_GENERATION_SYSTEM}\n---\n{user_section}"

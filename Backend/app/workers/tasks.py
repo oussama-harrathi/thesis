@@ -122,8 +122,8 @@ def process_document(self: Task, document_id: str, job_id: str) -> dict[str, Any
             # ── step 6: embedding ─────────────────────────────────
             updater.progress(60, "Generating embeddings…")
             vectors: list[list[float]] = []
+            emb_svc = EmbeddingService()
             if text_chunks:
-                emb_svc = EmbeddingService()
                 vectors = emb_svc.encode([c.content for c in text_chunks])
                 logger.info(
                     "[%s] embedded %d chunks (dim=%d)",
@@ -147,8 +147,12 @@ def process_document(self: Task, document_id: str, job_id: str) -> dict[str, Any
             )
             topic_count = 0
             if persisted_chunks:
-                topics = TopicExtractionService().save_topics(
-                    db, doc.course_id, persisted_chunks
+                topics = TopicExtractionService().save_topics_v2(
+                    db,
+                    doc.course_id,
+                    persisted_chunks,
+                    source_path=doc.file_path,
+                    embedding_service=emb_svc if text_chunks else None,
                 )
                 topic_count = len(topics)
                 logger.info(
@@ -271,122 +275,291 @@ def generate_from_blueprint(
 
     # ── Steps 3–5: async generation of all slots ──────────────────────
 
-    async def _run_generation() -> int:
+    # Query suffix per question type: makes retrieval pull different chunks
+    # for different cognitive tasks even when the topic name is identical.
+    _SLOT_QUERY_SUFFIXES: dict[str, str] = {
+        "mcq":          "definition concept example explain property",
+        "true_false":   "fact statement property rule characteristic",
+        "short_answer": "how why describe steps process mechanism",
+        "essay":        "discuss compare analyze relationship impact",
+    }
+
+    def _build_slot_query(topic_name: str, q_type_value: str) -> str:
+        suffix = _SLOT_QUERY_SUFFIXES.get(q_type_value, "")
+        return f"{topic_name} {suffix}".strip()
+
+    # Maximum LLM attempts per individual question before marking it failed.
+    MAX_SLOT_ATTEMPTS = 3
+
+    async def _run_generation() -> dict[str, Any]:
         """
         Async inner function: runs inside asyncio.run().
 
-        Uses the async SQLAlchemy session factory directly so we can pass the
-        session to QuestionGenerationService (which is fully async).
+        Expands each slot's count into individual 1-question attempts, retrying
+        up to MAX_SLOT_ATTEMPTS times per question.  Returns a summary dict.
 
-        Returns the total number of persisted Question rows.
+        Returns
+        -------
+        dict with keys: requested, generated, failed, failure_reasons
         """
         from app.core.database import async_session_factory
         from app.models.job import Job, JobStatus
         from app.models.question import QuestionType
         from app.services.question_generation_service import QuestionGenerationService
+        from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_trivial_question
 
         svc = QuestionGenerationService()
-        total_slots = len(slots)
+
+        # ── Job-level diversity state ─────────────────────────────────
+        # chunk IDs used across ALL slots; passed to retrieval to avoid reuse.
+        used_chunk_ids: set[uuid.UUID] = set()
+        # Question stems/texts generated so far; used for duplicate detection.
+        used_question_stems: list[str] = []
+        # Per-slot diagnostics stored in job metadata.
+        slot_diagnostics: list[dict[str, Any]] = []
+        # Trivial fraction guard: if trivial questions exceed this share of
+        # all generated questions, subsequent medium/hard slots get their
+        # Bloom target overridden to ANALYZE to force application questions.
+        TRIVIAL_FRACTION_LIMIT: float = 0.30
+
+        # Build a flat list of individual question specs (count=1 each).
+        individual_items: list[dict[str, Any]] = []
+        for slot in slots:
+            for _ in range(slot.count):
+                individual_items.append({
+                    "question_type": slot.question_type,
+                    "difficulty": slot.difficulty,
+                    "topic_id": slot.topic_id,
+                    "topic_name": slot.topic_name,
+                })
+
+        total_requested = len(individual_items)
         total_generated = 0
+        failed_count = 0
+        failure_reasons: list[str] = []
+
+        logger.info(
+            "generate_from_blueprint: %d slot(s) → %d individual question(s) to generate",
+            len(slots),
+            total_requested,
+        )
 
         async with async_session_factory() as db:
-            # Mark job running.
             job = await db.get(Job, job_uuid)
             if job:
                 job.status = JobStatus.running
                 job.progress = 0
-                job.message = f"Generating questions from {total_slots} slot(s)…"
+                job.message = f"Generating {total_requested} question(s)…"
                 await db.flush()
                 await db.commit()
 
-        for slot_idx, slot in enumerate(slots):
-            slot_label = (
-                f"{slot.question_type.value}/{slot.difficulty.value}/"
-                f"{slot.topic_name!r} x{slot.count}"
+        for item_idx, item in enumerate(individual_items):
+            q_type: QuestionType = item["question_type"]
+            difficulty_enum = item["difficulty"]
+            topic_id = item["topic_id"]
+            topic_name = item["topic_name"]
+            diff_str = difficulty_enum.value
+
+            item_label = (
+                f"[{item_idx + 1}/{total_requested}] "
+                f"type={q_type.value} diff={diff_str} topic={topic_name!r}"
             )
-            logger.info(
-                "generate_from_blueprint: slot %d/%d — %s",
-                slot_idx + 1,
-                total_slots,
-                slot_label,
-            )
 
-            async with async_session_factory() as db:
-                try:
-                    if slot.question_type == QuestionType.mcq:
-                        generated = await svc.generate_mcq(
-                            db,
-                            question_set_id=qs_uuid,
-                            course_id=course_id,
-                            topic_id=slot.topic_id,
-                            topic_name=slot.topic_name,
-                            difficulty=slot.difficulty.value,
-                            count=slot.count,
-                        )
-                    elif slot.question_type == QuestionType.true_false:
-                        generated = await svc.generate_true_false(
-                            db,
-                            question_set_id=qs_uuid,
-                            course_id=course_id,
-                            topic_id=slot.topic_id,
-                            topic_name=slot.topic_name,
-                            difficulty=slot.difficulty.value,
-                            count=slot.count,
-                        )
-                    else:
-                        logger.warning(
-                            "generate_from_blueprint: skipping unimplemented "
-                            "question type %r (slot %d)",
-                            slot.question_type.value,
-                            slot_idx + 1,
-                        )
-                        generated = []
+            slot_retrieval_query = _build_slot_query(topic_name, q_type.value)
+            chunk_ids_this_slot: list[uuid.UUID] = []
 
-                    total_generated += len(generated)
-                    await db.commit()
+            # Derive Bloom target for this slot.
+            base_bloom = DEFAULT_BLOOM_FOR_DIFFICULTY.get(diff_str, "apply")
 
-                except Exception as slot_exc:
-                    logger.error(
-                        "generate_from_blueprint: slot %d failed (%s): %s",
-                        slot_idx + 1,
-                        slot_label,
-                        slot_exc,
-                        exc_info=True,
+            # Distribution guard: if too many trivial questions have been
+            # generated so far, override Bloom to ANALYZE for non-easy slots.
+            if diff_str != "easy" and used_question_stems:
+                trivial_in_job = sum(
+                    1 for s in used_question_stems if is_trivial_question(s)
+                )
+                trivial_ratio = trivial_in_job / len(used_question_stems)
+                if trivial_ratio > TRIVIAL_FRACTION_LIMIT:
+                    base_bloom = "analyze"
+                    logger.info(
+                        "generate_from_blueprint: trivial ratio=%.0f%% > limit=%.0f%% — "
+                        "overriding bloom to ANALYZE for %s",
+                        trivial_ratio * 100, TRIVIAL_FRACTION_LIMIT * 100, item_label,
                     )
-                    await db.rollback()
-                    # Continue with remaining slots.
 
-            # Update progress (slot progress fills 0–90%; final 10% on complete).
-            progress = int((slot_idx + 1) / total_slots * 90)
+            generated_this = False
+            last_failure = "unknown"
+
+            for attempt in range(1, MAX_SLOT_ATTEMPTS + 1):
+                logger.info(
+                    "generate_from_blueprint: %s — attempt %d/%d",
+                    item_label, attempt, MAX_SLOT_ATTEMPTS,
+                )
+
+                async with async_session_factory() as db:
+                    try:
+                        if q_type == QuestionType.mcq:
+                            generated = await svc.generate_mcq(
+                                db,
+                                question_set_id=qs_uuid,
+                                course_id=course_id,
+                                topic_id=topic_id,
+                                topic_name=topic_name,
+                                difficulty=diff_str,
+                                count=1,
+                                retrieval_query=slot_retrieval_query,
+                                exclude_chunk_ids=used_chunk_ids,
+                                _out_chunk_ids=chunk_ids_this_slot,
+                                used_question_stems=used_question_stems,
+                                target_bloom=base_bloom,
+                            )
+                        elif q_type == QuestionType.true_false:
+                            generated = await svc.generate_true_false(
+                                db,
+                                question_set_id=qs_uuid,
+                                course_id=course_id,
+                                topic_id=topic_id,
+                                topic_name=topic_name,
+                                difficulty=diff_str,
+                                count=1,
+                                retrieval_query=slot_retrieval_query,
+                                exclude_chunk_ids=used_chunk_ids,
+                                _out_chunk_ids=chunk_ids_this_slot,
+                                used_question_stems=used_question_stems,
+                                target_bloom=base_bloom,
+                            )
+                        elif q_type == QuestionType.short_answer:
+                            generated = await svc.generate_short_answer(
+                                db,
+                                question_set_id=qs_uuid,
+                                course_id=course_id,
+                                topic_id=topic_id,
+                                topic_name=topic_name,
+                                difficulty=diff_str,
+                                count=1,
+                                retrieval_query=slot_retrieval_query,
+                                exclude_chunk_ids=used_chunk_ids,
+                                _out_chunk_ids=chunk_ids_this_slot,
+                                used_question_stems=used_question_stems,
+                                target_bloom=base_bloom,
+                            )
+                        else:
+                            logger.warning(
+                                "generate_from_blueprint: unimplemented type %r — skipping %s",
+                                q_type.value,
+                                item_label,
+                            )
+                            last_failure = f"type {q_type.value!r} not implemented"
+                            break
+
+                        if generated:
+                            total_generated += len(generated)
+                            generated_this = True
+                            # Register chunks as used so subsequent slots pull different material.
+                            used_chunk_ids.update(chunk_ids_this_slot)
+                            await db.commit()
+                            logger.info(
+                                "generate_from_blueprint: %s — OK on attempt %d "
+                                "(used_chunks=%d chunk_ids=%s)",
+                                item_label, attempt,
+                                len(used_chunk_ids),
+                                [str(c)[:8] for c in chunk_ids_this_slot],
+                            )
+                            break
+                        else:
+                            last_failure = "generation returned 0 questions (context insufficient or LLM refusal)"
+                            logger.warning(
+                                "generate_from_blueprint: %s — attempt %d returned 0 (will %s)",
+                                item_label, attempt,
+                                "retry" if attempt < MAX_SLOT_ATTEMPTS else "give up",
+                            )
+                            await db.rollback()
+
+                    except Exception as exc:
+                        last_failure = f"{type(exc).__name__}: {exc}"
+                        logger.error(
+                            "generate_from_blueprint: %s — attempt %d raised %s",
+                            item_label, attempt, exc, exc_info=True,
+                        )
+                        await db.rollback()
+
+            if not generated_this:
+                failed_count += 1
+                failure_reasons.append(f"{item_label}: {last_failure}")
+                logger.error(
+                    "generate_from_blueprint: %s — FAILED after %d attempts: %s",
+                    item_label, MAX_SLOT_ATTEMPTS, last_failure,
+                )
+
+            # Record per-slot diagnostic.
+            slot_diagnostics.append({
+                "slot": item_idx + 1,
+                "type": q_type.value,
+                "topic": topic_name,
+                "diff": diff_str,
+                "bloom": base_bloom,
+                "retrieval_query": slot_retrieval_query,
+                "chunk_ids": [str(c) for c in chunk_ids_this_slot],
+                "success": generated_this,
+            })
+
+            # Update job progress after each question.
+            progress = int((item_idx + 1) / total_requested * 90)
             async with async_session_factory() as db:
                 job = await db.get(Job, job_uuid)
                 if job:
                     job.progress = progress
                     job.message = (
-                        f"Slot {slot_idx + 1}/{total_slots} done — "
-                        f"{total_generated} questions generated so far."
+                        f"{item_idx + 1}/{total_requested} questions attempted — "
+                        f"{total_generated} OK, {failed_count} failed."
                     )
                     await db.flush()
                     await db.commit()
 
-        # Mark job complete.
+        # Build final job summary.
+        import json as _json2
+        trivial_in_job = sum(1 for s in used_question_stems if is_trivial_question(s))
+        summary = {
+            "requested": total_requested,
+            "generated": total_generated,
+            "failed": failed_count,
+            "failure_reasons": failure_reasons[:20],
+            "unique_chunks_used": len(used_chunk_ids),
+            "trivial_questions": trivial_in_job,
+            "trivial_fraction": round(trivial_in_job / max(total_generated, 1), 2),
+            "slots": slot_diagnostics,
+        }
+        is_partial = total_generated < total_requested
+        final_message = (
+            f"{'PARTIAL — ' if is_partial else ''}Generated {total_generated}/{total_requested} question(s)."
+        )
+
         async with async_session_factory() as db:
             job = await db.get(Job, job_uuid)
             if job:
                 job.status = JobStatus.completed
                 job.progress = 100
-                job.message = (
-                    f"Completed: {total_generated} question(s) generated "
-                    f"from {total_slots} slot(s)."
-                )
+                job.message = final_message[:500]
+                # Store full summary in error field (Text column) when partial.
+                if is_partial or failure_reasons:
+                    job.error = _json2.dumps(summary, default=str)
                 await db.flush()
                 await db.commit()
 
-        return total_generated
+        logger.info(
+            "generate_from_blueprint: DONE — requested=%d generated=%d failed=%d blueprint=%s",
+            total_requested, total_generated, failed_count, blueprint_id,
+        )
+        return summary
 
     try:
-        n_generated = asyncio.run(_run_generation())
+        summary = asyncio.run(_run_generation())
+        n_generated = summary["generated"]
+        n_requested = summary["requested"]
+        n_failed = summary["failed"]
     except Exception as exc:
+        n_generated = 0
+        n_requested = sum(s.count for s in slots)
+        n_failed = n_requested
         logger.exception(
             "generate_from_blueprint failed | blueprint=%s job=%s error=%s",
             blueprint_id,
@@ -403,14 +576,18 @@ def generate_from_blueprint(
         raise self.retry(exc=exc)
 
     logger.info(
-        "generate_from_blueprint completed | blueprint=%s generated=%d",
+        "generate_from_blueprint completed | blueprint=%s requested=%d generated=%d failed=%d",
         blueprint_id,
+        n_requested,
         n_generated,
+        n_failed,
     )
     return {
         "blueprint_id": blueprint_id,
         "job_id": job_id,
         "question_set_id": question_set_id,
+        "requested": n_requested,
         "generated": n_generated,
-        "status": "completed",
+        "failed": n_failed,
+        "status": "completed" if n_failed == 0 else "partial",
     }

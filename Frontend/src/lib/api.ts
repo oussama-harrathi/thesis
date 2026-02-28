@@ -16,6 +16,7 @@ import type {
   Topic,
   TopicCreate,
   TopicUpdate,
+  TopicListResponse,
   QuestionListItem,
   QuestionDetail,
   QuestionUpdateRequest,
@@ -96,6 +97,14 @@ export const coursesApi = {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
+
+  delete: (courseId: string) =>
+    fetch(`${BASE_URL}/api/v1/courses/${courseId}`, { method: 'DELETE' }).then(async (res) => {
+      if (!res.ok && res.status !== 204) {
+        const text = await res.text().catch(() => res.statusText)
+        throw new ApiError(res.status, text)
+      }
+    }),
 }
 
 // ── Documents ─────────────────────────────────────────────────────
@@ -134,7 +143,7 @@ export const documentsApi = {
 // ── Topics ────────────────────────────────────────────────────────
 export const topicsApi = {
   listByCourse: (courseId: string) =>
-    apiRequest<Topic[]>(`/courses/${courseId}/topics`),
+    apiRequest<TopicListResponse>(`/courses/${courseId}/topics`),
 
   create: (courseId: string, body: TopicCreate) =>
     apiRequest<Topic>(`/courses/${courseId}/topics`, {
@@ -156,6 +165,11 @@ export const topicsApi = {
         const text = await res.text().catch(() => res.statusText)
         throw new ApiError(res.status, text)
       }
+    }),
+
+  reextract: (courseId: string) =>
+    apiRequest<TopicListResponse>(`/courses/${courseId}/topics/reextract`, {
+      method: 'POST',
     }),
 }
 

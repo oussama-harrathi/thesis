@@ -73,3 +73,14 @@ async def update_course(
             detail=f"Course {course_id} not found.",
         )
     return CourseResponse.model_validate(course)
+
+
+@router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_course(course_id: uuid.UUID, svc: Service) -> None:
+    """Delete a course and all its associated data (cascades)."""
+    deleted = await svc.delete(course_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Course {course_id} not found.",
+        )

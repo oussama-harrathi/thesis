@@ -43,6 +43,22 @@ class Topic(Base):
         Boolean, nullable=False, default=True, server_default="true"
     )
 
+    # ── Hierarchy & metadata (added in migration c1d2e3f4a5b6) ───
+    parent_topic_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("topics.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # "CHAPTER" | "SECTION" | "SUBSECTION" — populated for TOC-extracted topics
+    level: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # "AUTO" | "TOC" | "MANUAL"
+    source: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, server_default="AUTO"
+    )
+    # Fraction of course chunks mapped to this topic (0–1); None until computed
+    coverage_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), nullable=False
     )
@@ -57,9 +73,23 @@ class Topic(Base):
         back_populates="topic",
         cascade="all, delete-orphan",
     )
+    # Self-referential: children of this topic
+    children: Mapped[list[Topic]] = relationship(
+        "Topic",
+        foreign_keys="Topic.parent_topic_id",
+        back_populates="parent",
+        lazy="select",
+    )
+    parent: Mapped[Topic | None] = relationship(
+        "Topic",
+        foreign_keys="Topic.parent_topic_id",
+        back_populates="children",
+        remote_side="Topic.id",
+        lazy="select",
+    )
 
     def __repr__(self) -> str:
-        return f"<Topic id={self.id} name={self.name!r}>"
+        return f"<Topic id={self.id} name={self.name!r} level={self.level!r}>"
 
 
 class TopicChunkMap(Base):

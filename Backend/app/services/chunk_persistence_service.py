@@ -87,6 +87,8 @@ class ChunkPersistenceService:
                 chunk_index=chunk.chunk_index,
                 start_char=chunk.start_char,
                 end_char=chunk.end_char,
+                page_start=getattr(chunk, "page_start", None),
+                page_end=getattr(chunk, "page_end", None),
                 embedding=embedding,
             )
             self._db.add(row)

@@ -62,6 +62,12 @@ export interface Topic {
   course_id: string
   name: string
   is_auto_extracted: boolean
+  source: string | null
+  level: string | null          // 'CHAPTER' | 'SECTION' | 'SUBSECTION'
+  parent_topic_id: string | null
+  coverage_score: number | null
+  chunk_count: number
+  is_noisy_suspect: boolean
   created_at: string
   updated_at: string
 }
@@ -72,6 +78,19 @@ export interface TopicCreate {
 
 export interface TopicUpdate {
   name: string
+}
+
+export interface ExtractionMeta {
+  chosen_method: string
+  overall_confidence: number
+  is_low_confidence: boolean
+  coverage_ratio: number
+  topic_count: number
+}
+
+export interface TopicListResponse {
+  topics: Topic[]
+  extraction_meta: ExtractionMeta | null
 }
 
 // ── Questions ─────────────────────────────────────────────────────
@@ -253,7 +272,16 @@ export interface Job {
   status: JobStatus
   progress: number
   message: string | null
+  /** JSON-encoded summary written by the worker: {requested,generated,failed,failure_reasons} */
+  error: string | null
   created_at: string
+}
+
+export interface JobSummary {
+  requested: number
+  generated: number
+  failed: number
+  failure_reasons: string[]
 }
 
 // ── Blueprints ────────────────────────────────────────────────────

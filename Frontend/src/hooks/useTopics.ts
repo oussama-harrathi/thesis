@@ -51,3 +51,13 @@ export function useDeleteTopic(courseId: string) {
     },
   })
 }
+
+export function useReextractTopics(courseId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => topicsApi.reextract(courseId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: topicKeys.byCourse(courseId) })
+    },
+  })
+}

@@ -44,6 +44,9 @@ class Chunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     start_char: Mapped[int | None] = mapped_column(Integer, nullable=True)
     end_char: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Page range (1-based) -- populated when extraction result is available
+    page_start: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    page_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ── Embedding (pgvector, dim=384) ─────────────────────────────
     embedding: Mapped[list[float] | None] = mapped_column(

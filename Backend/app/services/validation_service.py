@@ -56,6 +56,8 @@ from app.models.question import BloomLevel, Difficulty, McqOption, Question, Que
 if TYPE_CHECKING:
     from app.llm.base import BaseLLMProvider
 
+from app.llm.base import GenerationSettings
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,8 @@ VALIDATION_TYPE_GROUNDING = "grounding"
 VALIDATION_TYPE_DISTRACTOR = "distractor"
 VALIDATION_TYPE_DIFFICULTY = "difficulty"
 VALIDATION_TYPE_BLOOM = "bloom"
+VALIDATION_TYPE_TRIVIALITY = "triviality"
+VALIDATION_TYPE_CORRECTNESS = "correctness"
 
 
 # ── Result types ──────────────────────────────────────────────────────────────
@@ -179,6 +183,115 @@ class DistractorValidationResult:
     issues: list[DistractorIssue]
     option_count: int
     correct_count: int
+
+
+# ── Triviality validation types ──────────────────────────────────────────────
+
+
+class TrivialityOutcome(str, enum.Enum):
+    """Outcome levels for triviality checks."""
+    PASS = "pass"   # question is non-trivial (requires reasoning)
+    WARN = "warn"   # trivial stem but difficulty=EASY or bloom=REMEMBER (acceptable)
+    FAIL = "fail"   # trivial stem AND difficulty is MEDIUM or HARD
+
+
+_TRIVIALITY_SCORE: dict[TrivialityOutcome, float] = {
+    TrivialityOutcome.PASS: 1.0,
+    TrivialityOutcome.WARN: 0.5,
+    TrivialityOutcome.FAIL: 0.0,
+}
+
+
+@dataclass
+class TrivialityValidationResult:
+    """Full result of a triviality check on a single question."""
+    question_id: uuid.UUID
+    outcome: TrivialityOutcome
+    passed: bool
+    score: float
+    is_trivial: bool
+    target_difficulty: str
+    target_bloom: str
+    detail: str
+
+
+def check_trivial_stem(stem: str) -> bool:
+    """Return True if *stem* matches known trivial definition/recall patterns."""
+    from app.utils.chunk_filter import is_trivial_question  # local import avoids cycle
+    return is_trivial_question(stem)
+
+
+# ── Correctness verification types ────────────────────────────────────────────
+
+
+class CorrectnessVerdict(str, enum.Enum):
+    """Possible outcomes from the LLM correctness verifier."""
+    CORRECT           = "correct"            # label / marked option is definitively right
+    WRONG_LABEL       = "wrong_label"        # TF: truth label is inverted
+    WRONG_CORRECT     = "wrong_correct"      # MCQ: a different option is clearly best
+    MULTIPLE_CORRECT  = "multiple_correct"   # MCQ: two+ options are defensibly correct
+    AMBIGUOUS         = "ambiguous"          # context does not resolve the question
+    ERROR             = "error"              # verifier LLM call failed
+
+
+_CORRECTNESS_SCORE: dict[CorrectnessVerdict, float] = {
+    CorrectnessVerdict.CORRECT:          1.0,
+    CorrectnessVerdict.AMBIGUOUS:        0.5,
+    CorrectnessVerdict.WRONG_LABEL:      0.0,
+    CorrectnessVerdict.WRONG_CORRECT:    0.0,
+    CorrectnessVerdict.MULTIPLE_CORRECT: 0.0,
+    CorrectnessVerdict.ERROR:            0.5,  # fail-open
+}
+
+
+@dataclass
+class CorrectnessResult:
+    """
+    Result of a pre-persist correctness verification pass.
+
+    Shared by TF and MCQ verification; type-specific fields are nullable.
+
+    Attributes
+    ----------
+    verdict         : Classification outcome.
+    confidence      : 0.0–1.0 from the verifier LLM.
+    reason          : One-sentence explanation referencing context.
+    should_reject   : True → caller must NOT persist this question.
+    should_flip     : True → TF answer label was wrong; flip before persisting.
+    correct_is_true : New truth value when should_flip=True (TF only).
+    correct_key     : Best option key per verifier (MCQ only).
+    question_type   : "tf" | "mcq" — discriminator for downstream handling.
+    """
+
+    verdict:         CorrectnessVerdict
+    confidence:      float
+    reason:          str
+    should_reject:   bool
+    should_flip:     bool = False
+    correct_is_true: bool | None = None
+    correct_key:     str | None  = None
+    question_type:   str         = "unknown"
+
+
+# ── LLM output schemas (parsed from verifier responses) ──────────────────────
+
+
+class _LLMTFCorrectnessOutput(BaseModel):
+    """Pydantic schema for TF correctness verifier LLM response."""
+
+    verdict:       str   = Field(default="ambiguous")
+    confidence:    float = Field(default=0.5, ge=0.0, le=1.0)
+    reason:        str   = Field(default="")
+    should_be_true: bool = Field(default=True)
+
+
+class _LLMMCQCorrectnessOutput(BaseModel):
+    """Pydantic schema for MCQ correctness verifier LLM response."""
+
+    verdict:     str   = Field(default="ambiguous")
+    confidence:  float = Field(default=0.5, ge=0.0, le=1.0)
+    reason:      str   = Field(default="")
+    correct_key: str   = Field(default="A")
 
 
 # ── Pure helper functions (testable without DB) ───────────────────────────────
@@ -466,7 +579,6 @@ async def _llm_difficulty(
     Ask the LLM provider to classify difficulty.
     Raises on provider or parse errors (caller must handle).
     """
-    from app.llm.base import GenerationSettings
     from app.llm.prompts.difficulty_classifier import (
         DIFFICULTY_CLASSIFIER_SYSTEM,
         DIFFICULTY_CLASSIFIER_USER,
@@ -653,7 +765,6 @@ async def _llm_bloom(
     Ask the LLM provider to classify Bloom taxonomy level.
     Raises on provider or parse errors (caller must handle).
     """
-    from app.llm.base import GenerationSettings
     from app.llm.prompts.bloom_classifier import (
         BLOOM_CLASSIFIER_SYSTEM,
         BLOOM_CLASSIFIER_USER,
@@ -1001,6 +1112,23 @@ class ValidationService:
                     exc,
                 )
 
+        # Post-check C: trivial definition stems must not be tagged MEDIUM/HARD.
+        # If the stem is a direct recall question, cap the difficulty to EASY
+        # and store a note in the reasoning for auditability.
+        if check_trivial_stem(question.body) and final_difficulty in (
+            Difficulty.medium, Difficulty.hard
+        ):
+            logger.debug(
+                "tag_difficulty: overriding %s → easy for trivial stem question=%s",
+                final_difficulty.value, question.id,
+            )
+            final_difficulty = Difficulty.easy
+            final_confidence = max(final_confidence, 0.55)
+            final_reasoning = (
+                final_reasoning
+                + "; [overridden→EASY: stem matches trivial definition/recall pattern]"
+            )
+
         result = DifficultyTaggingResult(
             question_id=question.id,
             difficulty=final_difficulty,
@@ -1113,6 +1241,22 @@ class ValidationService:
                     exc,
                 )
 
+        # Post-check C: cap trivial stems to UNDERSTAND (Bloom level 2) at most.
+        if check_trivial_stem(question.body) and final_level not in (
+            BloomLevel.remember, BloomLevel.understand
+        ):
+            logger.debug(
+                "tag_bloom: overriding %s → understand for trivial stem question=%s",
+                final_level.value, question.id,
+            )
+            final_level = BloomLevel.understand
+            final_key_verb = final_key_verb or "define/recall"
+            final_confidence = max(final_confidence, 0.55)
+            final_reasoning = (
+                final_reasoning
+                + "; [overridden→UNDERSTAND: stem matches trivial definition/recall pattern]"
+            )
+
         result = BloomTaggingResult(
             question_id=question.id,
             bloom_level=final_level,
@@ -1159,6 +1303,345 @@ class ValidationService:
             )
 
         return result
+
+    # ------------------------------------------------------------------ #
+    # Triviality validator                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def validate_triviality(
+        self,
+        db: AsyncSession,
+        question: Question,
+        *,
+        target_difficulty: str = "medium",
+        target_bloom: str = "apply",
+        save: bool = True,
+    ) -> TrivialityValidationResult:
+        """
+        Check whether the question stem is a trivial definition/recall question
+        and whether that is acceptable given the target difficulty and Bloom level.
+
+        A FAIL is issued when:
+          - The stem matches a known trivial pattern (What is X? / Define X / …)
+          - AND target difficulty is not EASY
+          - AND target Bloom level is not REMEMBER
+
+        A WARN is issued when the stem is trivial but the slot targets easy/remember
+        (i.e., recall questions are acceptable for that slot).
+
+        PASS is issued when the stem does not match any trivial pattern.
+
+        Parameters
+        ----------
+        db                 : Open async session.
+        question           : The Question ORM instance to check.
+        target_difficulty  : Difficulty string the slot was targeting.
+        target_bloom       : Bloom level string the slot was targeting.
+        save               : If True, persist a QuestionValidation row.
+        """
+        stem = question.body or ""
+        trivial = check_trivial_stem(stem)
+
+        is_easy = target_difficulty.lower() == "easy"
+        is_recall = target_bloom.lower() == "remember"
+
+        if not trivial:
+            outcome = TrivialityOutcome.PASS
+        elif is_easy or is_recall:
+            outcome = TrivialityOutcome.WARN
+        else:
+            outcome = TrivialityOutcome.FAIL
+
+        score = _TRIVIALITY_SCORE[outcome]
+        passed = outcome in (TrivialityOutcome.PASS, TrivialityOutcome.WARN)
+
+        detail = (
+            f"Stem appears trivial={trivial}; "
+            f"target_difficulty={target_difficulty}, target_bloom={target_bloom}; "
+            f"outcome={outcome.value}"
+        )
+
+        result = TrivialityValidationResult(
+            question_id=question.id,
+            outcome=outcome,
+            passed=passed,
+            score=score,
+            is_trivial=trivial,
+            target_difficulty=target_difficulty,
+            target_bloom=target_bloom,
+            detail=detail,
+        )
+
+        if save:
+            await self._write_validation(
+                db,
+                question_id=question.id,
+                validation_type=VALIDATION_TYPE_TRIVIALITY,
+                passed=passed,
+                score=score,
+                detail=json.dumps({"trivial": trivial, "difficulty": target_difficulty,
+                                   "bloom": target_bloom, "outcome": outcome.value}),
+            )
+            if outcome == TrivialityOutcome.FAIL:
+                logger.warning(
+                    "validate_triviality: FAIL — trivial stem for %s/%s question=%s stem=%r",
+                    target_difficulty, target_bloom, question.id, stem[:80],
+                )
+            elif outcome == TrivialityOutcome.WARN:
+                logger.debug(
+                    "validate_triviality: WARN — trivial stem acceptable for %s/%s question=%s",
+                    target_difficulty, target_bloom, question.id,
+                )
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Correctness verification (pre-persist, LLM-assisted)                #
+    # ------------------------------------------------------------------ #
+
+    async def verify_tf_correctness(
+        self,
+        *,
+        statement: str,
+        is_true: bool,
+        context_text: str,
+        provider: "BaseLLMProvider",
+    ) -> CorrectnessResult:
+        """
+        Ask the LLM verifier whether a True/False statement has the right label.
+
+        Parameters
+        ----------
+        statement    : The declarative statement shown to the student.
+        is_true      : The truth label claimed by the generator.
+        context_text : The context string used during generation (source of truth).
+        provider     : LLM provider to call.
+
+        Returns
+        -------
+        CorrectnessResult — always returns (never raises); on provider error
+        returns a safe fail-open result (AMBIGUOUS, should_reject=False).
+        """
+        from app.llm.prompts.correctness_verifier import (
+            TF_CORRECTNESS_SYSTEM,
+            TF_CORRECTNESS_USER,
+        )
+
+        # Truncate context to keep verifier calls cheap (≤ 1 200 chars).
+        ctx = context_text[:1200].strip()
+        claimed_str = "True" if is_true else "False"
+
+        prompt = (
+            TF_CORRECTNESS_SYSTEM
+            + "\n---\n"
+            + TF_CORRECTNESS_USER.format(
+                context=ctx,
+                statement=statement,
+                claimed_value=claimed_str,
+            )
+        )
+
+        try:
+            settings = GenerationSettings(temperature=0.1, max_tokens=200)
+            output: _LLMTFCorrectnessOutput = await provider.generate_json(
+                prompt, _LLMTFCorrectnessOutput, settings
+            )
+        except Exception as exc:
+            logger.warning(
+                "verify_tf_correctness: LLM call failed — fail-open: %s", exc
+            )
+            return CorrectnessResult(
+                verdict=CorrectnessVerdict.ERROR,
+                confidence=0.5,
+                reason=f"Verifier LLM call failed: {exc}",
+                should_reject=False,
+                question_type="tf",
+            )
+
+        # Normalise and map verdict string.
+        raw_verdict = output.verdict.lower().strip().replace(" ", "_")
+        try:
+            verdict = CorrectnessVerdict(raw_verdict)
+        except ValueError:
+            verdict = CorrectnessVerdict.AMBIGUOUS
+
+        # Decision logic:
+        #   WRONG_LABEL + high confidence → flip (do not reject)
+        #   WRONG_LABEL + low confidence  → reject (uncertain, better to skip)
+        #   AMBIGUOUS                     → keep (save as WARN)
+        #   CORRECT / ERROR               → keep
+        should_flip   = False
+        should_reject = False
+        correct_is_true: bool | None = None
+
+        if verdict == CorrectnessVerdict.WRONG_LABEL:
+            if output.confidence >= 0.80:
+                should_flip     = True
+                correct_is_true = output.should_be_true
+                logger.info(
+                    "verify_tf_correctness: FLIP — statement=%r was=%s now=%s "
+                    "confidence=%.2f",
+                    statement[:60], claimed_str, correct_is_true, output.confidence,
+                )
+            else:
+                should_reject = True
+                logger.warning(
+                    "verify_tf_correctness: REJECT — wrong label but low confidence "
+                    "(%.2f) for statement=%r",
+                    output.confidence, statement[:60],
+                )
+
+        return CorrectnessResult(
+            verdict=verdict,
+            confidence=output.confidence,
+            reason=output.reason,
+            should_reject=should_reject,
+            should_flip=should_flip,
+            correct_is_true=correct_is_true,
+            question_type="tf",
+        )
+
+    async def verify_mcq_correctness(
+        self,
+        *,
+        stem: str,
+        options_text: str,
+        claimed_correct: str,
+        context_text: str,
+        provider: "BaseLLMProvider",
+    ) -> CorrectnessResult:
+        """
+        Ask the LLM verifier whether the marked correct MCQ option is actually correct.
+
+        Parameters
+        ----------
+        stem            : The question text.
+        options_text    : Pre-formatted options string (one line per option).
+        claimed_correct : Key of the option marked as correct (\"A\"–\"D\").
+        context_text    : Context string used during generation.
+        provider        : LLM provider to call.
+
+        Returns
+        -------
+        CorrectnessResult — always returns; fail-open on provider error.
+        """
+        from app.llm.prompts.correctness_verifier import (
+            MCQ_CORRECTNESS_SYSTEM,
+            MCQ_CORRECTNESS_USER,
+        )
+
+        ctx = context_text[:1200].strip()
+
+        prompt = (
+            MCQ_CORRECTNESS_SYSTEM
+            + "\n---\n"
+            + MCQ_CORRECTNESS_USER.format(
+                context=ctx,
+                stem=stem,
+                options_text=options_text,
+                claimed_correct=claimed_correct,
+            )
+        )
+
+        try:
+            settings = GenerationSettings(temperature=0.1, max_tokens=200)
+            output: _LLMMCQCorrectnessOutput = await provider.generate_json(
+                prompt, _LLMMCQCorrectnessOutput, settings
+            )
+        except Exception as exc:
+            logger.warning(
+                "verify_mcq_correctness: LLM call failed — fail-open: %s", exc
+            )
+            return CorrectnessResult(
+                verdict=CorrectnessVerdict.ERROR,
+                confidence=0.5,
+                reason=f"Verifier LLM call failed: {exc}",
+                should_reject=False,
+                correct_key=claimed_correct,
+                question_type="mcq",
+            )
+
+        raw_verdict = output.verdict.lower().strip().replace(" ", "_")
+        try:
+            verdict = CorrectnessVerdict(raw_verdict)
+        except ValueError:
+            verdict = CorrectnessVerdict.AMBIGUOUS
+
+        # Decision logic:
+        #   WRONG_CORRECT + high confidence   → reject (cannot safely fix MCQ label)
+        #   MULTIPLE_CORRECT                  → reject (distractor design flaw)
+        #   AMBIGUOUS                         → keep (WARN)
+        #   CORRECT / ERROR                   → keep
+        should_reject = False
+        if verdict == CorrectnessVerdict.WRONG_CORRECT and output.confidence >= 0.80:
+            should_reject = True
+            logger.warning(
+                "verify_mcq_correctness: REJECT — wrong correct option "
+                "(verifier says %r, was %r, confidence=%.2f) stem=%r",
+                output.correct_key, claimed_correct, output.confidence, stem[:60],
+            )
+        elif verdict == CorrectnessVerdict.MULTIPLE_CORRECT:
+            should_reject = True
+            logger.warning(
+                "verify_mcq_correctness: REJECT — multiple correct options "
+                "detected (confidence=%.2f) stem=%r",
+                output.confidence, stem[:60],
+            )
+
+        # Normalise correct_key: only A–D is valid.
+        ck = output.correct_key.upper().strip() if output.correct_key else claimed_correct
+        if ck not in {"A", "B", "C", "D"}:
+            ck = claimed_correct
+
+        return CorrectnessResult(
+            verdict=verdict,
+            confidence=output.confidence,
+            reason=output.reason,
+            should_reject=should_reject,
+            correct_key=ck,
+            question_type="mcq",
+        )
+
+    async def persist_correctness_result(
+        self,
+        db: AsyncSession,
+        question_id: uuid.UUID,
+        result: CorrectnessResult,
+    ) -> None:
+        """
+        Write a QuestionValidation row for a pre-computed CorrectnessResult.
+
+        Called from ``_run_validators`` after the question has been persisted.
+        Does NOT raise — logs and returns on write error.
+        """
+        score  = _CORRECTNESS_SCORE.get(result.verdict, 0.5)
+        passed = not result.should_reject
+
+        detail_payload = {
+            "verdict":         result.verdict.value,
+            "confidence":      result.confidence,
+            "reason":          result.reason,
+            "should_reject":   result.should_reject,
+            "should_flip":     result.should_flip,
+            "correct_is_true": result.correct_is_true,
+            "correct_key":     result.correct_key,
+            "question_type":   result.question_type,
+        }
+
+        try:
+            await self._write_validation(
+                db,
+                question_id=question_id,
+                validation_type=VALIDATION_TYPE_CORRECTNESS,
+                passed=passed,
+                score=score,
+                detail=json.dumps(detail_payload),
+            )
+        except Exception as exc:
+            logger.error(
+                "persist_correctness_result: write failed for question=%s: %s",
+                question_id, exc,
+            )
 
     # ------------------------------------------------------------------ #
     # Shared persistence helper                                            #

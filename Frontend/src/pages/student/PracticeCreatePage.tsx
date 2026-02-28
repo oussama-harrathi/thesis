@@ -53,6 +53,7 @@ export default function PracticeCreatePage() {
     queryKey: ['topics', courseId],
     queryFn: () => topicsApi.listByCourse(courseId),
     enabled: Boolean(courseId),
+    select: (data) => data.topics,
   })
 
   // ── Handlers ──────────────────────────────────────────────────
