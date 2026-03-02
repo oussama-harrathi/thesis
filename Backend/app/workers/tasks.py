@@ -305,10 +305,38 @@ def generate_from_blueprint(
         from app.core.database import async_session_factory
         from app.models.job import Job, JobStatus
         from app.models.question import QuestionType
+        from app.services.diversity_service import DiversityContext, DiversityService
         from app.services.question_generation_service import QuestionGenerationService
         from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_trivial_question
 
         svc = QuestionGenerationService()
+        diversity_svc = DiversityService()
+
+        # ── Generate a per-run seed from job UUID ───────────────────────────
+        # The seed changes every run (job UUID is unique) so chunk selection
+        # and slot ordering vary across repeated blueprint runs.
+        generation_seed: int = job_uuid.int & 0xFFFF_FFFF
+        logger.info(
+            "generate_from_blueprint: generation_seed=%d for job=%s",
+            generation_seed, job_id,
+        )
+
+        # ── Load diversity context + historical chunk IDs (once per run) ─────
+        diversity_ctx: DiversityContext
+        penalize_chunk_ids: set[uuid.UUID]
+        async with async_session_factory() as db:
+            diversity_ctx = await diversity_svc.load_context(
+                db, course_id=course_id, recent_limit=100
+            )
+            penalize_chunk_ids = await diversity_svc.load_recent_chunk_ids(
+                db, course_id=course_id, limit=200
+            )
+        logger.info(
+            "generate_from_blueprint: diversity loaded — blacklist=%d recent=%d penalize_chunks=%d",
+            len(diversity_ctx.blacklist_fingerprints),
+            len(diversity_ctx.recent_fingerprints),
+            len(penalize_chunk_ids),
+        )
 
         # ── Job-level diversity state ─────────────────────────────────
         # chunk IDs used across ALL slots; passed to retrieval to avoid reuse.
@@ -332,6 +360,18 @@ def generate_from_blueprint(
                     "topic_id": slot.topic_id,
                     "topic_name": slot.topic_name,
                 })
+
+        # ── Seeded shuffle for cross-run slot order diversity ─────────────
+        # Randomising slot order changes which topic/chunks get retrieved first,
+        # which in turn shifts what the accumulating exclude_chunk_ids set
+        # blocks in later slots — producing meaningfully different questions.
+        import random as _rnd_slots
+        _rng_slots = _rnd_slots.Random(generation_seed)
+        _rng_slots.shuffle(individual_items)
+        logger.info(
+            "generate_from_blueprint: shuffled %d item(s) with seed=%d",
+            len(individual_items), generation_seed,
+        )
 
         total_requested = len(individual_items)
         total_generated = 0
@@ -411,6 +451,9 @@ def generate_from_blueprint(
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
+                                diversity_ctx=diversity_ctx,
+                                generation_seed=generation_seed,
+                                penalize_chunk_ids=penalize_chunk_ids,
                             )
                         elif q_type == QuestionType.true_false:
                             generated = await svc.generate_true_false(
@@ -426,6 +469,9 @@ def generate_from_blueprint(
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
+                                diversity_ctx=diversity_ctx,
+                                generation_seed=generation_seed,
+                                penalize_chunk_ids=penalize_chunk_ids,
                             )
                         elif q_type == QuestionType.short_answer:
                             generated = await svc.generate_short_answer(
@@ -441,6 +487,27 @@ def generate_from_blueprint(
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
+                                diversity_ctx=diversity_ctx,
+                                generation_seed=generation_seed,
+                                penalize_chunk_ids=penalize_chunk_ids,
+                            )
+                        elif q_type == QuestionType.essay:
+                            generated = await svc.generate_essay(
+                                db,
+                                question_set_id=qs_uuid,
+                                course_id=course_id,
+                                topic_id=topic_id,
+                                topic_name=topic_name,
+                                difficulty=diff_str,
+                                count=1,
+                                retrieval_query=slot_retrieval_query,
+                                exclude_chunk_ids=used_chunk_ids,
+                                _out_chunk_ids=chunk_ids_this_slot,
+                                used_question_stems=used_question_stems,
+                                target_bloom=base_bloom,
+                                diversity_ctx=diversity_ctx,
+                                generation_seed=generation_seed,
+                                penalize_chunk_ids=penalize_chunk_ids,
                             )
                         else:
                             logger.warning(
@@ -526,6 +593,11 @@ def generate_from_blueprint(
             "unique_chunks_used": len(used_chunk_ids),
             "trivial_questions": trivial_in_job,
             "trivial_fraction": round(trivial_in_job / max(total_generated, 1), 2),
+            # Diversity / rejection-memory stats
+            "generation_seed": generation_seed,
+            "blacklist_avoided": diversity_ctx.blacklist_avoided,
+            "cross_run_dedup_avoided": diversity_ctx.dedup_avoided,
+            "historical_chunks_penalized": len(penalize_chunk_ids),
             "slots": slot_diagnostics,
         }
         is_partial = total_generated < total_requested
@@ -552,6 +624,13 @@ def generate_from_blueprint(
         return summary
 
     try:
+        # Dispose the async engine's connection pool before creating a new event
+        # loop.  asyncio.run() creates a fresh loop each call; asyncpg connections
+        # are bound to the loop they were created on.  Disposing flushes all
+        # pooled connections so new ones are opened in the correct loop context.
+        from app.core.database import engine as _db_engine  # noqa: PLC0415
+        _db_engine.sync_engine.dispose()  # sync-safe: flushes asyncpg pool before new event loop
+
         summary = asyncio.run(_run_generation())
         n_generated = summary["generated"]
         n_requested = summary["requested"]

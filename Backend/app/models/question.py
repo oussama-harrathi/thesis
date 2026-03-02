@@ -20,6 +20,7 @@ from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
+from pgvector.sqlalchemy import Vector
 
 from app.core.database import Base
 
@@ -144,6 +145,22 @@ class Question(Base):
     prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     insufficient_context: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    # ── Diversity / fingerprint ───────────────────────────────────
+    # SHA-256 of normalised question stem — used for exact-duplicate detection.
+    fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    # Sentence-Transformers embedding (all-MiniLM-L6-v2, dim=384).
+    # Enables semantic near-duplicate detection against blacklist and recent runs.
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(384), nullable=True
+    )
+    # The QuestionSet id (= job's question_set_id) this question belongs to,
+    # stored as a convenience for cross-run analytics without extra joins.
+    generation_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
     )
 
     created_at: Mapped[datetime] = mapped_column(

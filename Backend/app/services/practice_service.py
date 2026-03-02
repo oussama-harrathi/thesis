@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random as _rnd
 import uuid
 from typing import Sequence
 
@@ -87,7 +88,15 @@ class PracticeService:
         Session is NOT committed here — the FastAPI ``get_db`` dependency
         handles commit/rollback after the route handler returns.
         """
-        difficulty = (payload.difficulty or Difficulty.medium).value
+        # When difficulty is None (user left it unset / "random"), we vary
+        # difficulty randomly per slice instead of always defaulting to medium.
+        _use_random_difficulty = payload.difficulty is None
+        _RANDOM_DIFFICULTIES = [Difficulty.easy, Difficulty.medium, Difficulty.hard]
+
+        def _pick_difficulty() -> str:
+            if _use_random_difficulty:
+                return _rnd.choice(_RANDOM_DIFFICULTIES).value
+            return payload.difficulty.value  # type: ignore[union-attr]
 
         # ── Warn about and filter unsupported question types ──────────
         unsupported = [t for t in payload.question_types if t not in _SUPPORTED_TYPES]
@@ -100,8 +109,13 @@ class PracticeService:
 
         active_types = [t for t in payload.question_types if t in _SUPPORTED_TYPES]
 
-        # ── Resolve topic metadata if topic_ids were supplied ─────────
-        topics: list[Topic] = []
+        # ── Resolve topic metadata ────────────────────────────────────
+        # user_topics: explicitly chosen by the student (may be empty)
+        # auto_topics: full shuffled list when no topic_ids supplied;
+        #              sliced to per_type inside the generation loop so that
+        #              total slices never exceed the requested count.
+        user_topics: list[Topic] = []
+        auto_topics: list[Topic] = []
         if payload.topic_ids:
             result = await db.execute(
                 select(Topic).where(
@@ -109,12 +123,27 @@ class PracticeService:
                     Topic.course_id == payload.course_id,
                 )
             )
-            topics = list(result.scalars().all())
-            if not topics:
+            user_topics = list(result.scalars().all())
+            if not user_topics:
                 logger.warning(
                     "create_practice_set: topic_ids provided but none matched "
                     "course=%s — falling back to full-course retrieval",
                     payload.course_id,
+                )
+        else:
+            # No topics selected → load all, shuffle for variety.
+            # We deliberately do NOT cap here; the cap is applied per-type
+            # inside the loop using per_type, so the total number of
+            # generation slices always equals count (not count × n_types).
+            result = await db.execute(
+                select(Topic).where(Topic.course_id == payload.course_id)
+            )
+            auto_topics = list(result.scalars().all())
+            _rnd.shuffle(auto_topics)
+            if auto_topics:
+                logger.info(
+                    "create_practice_set: auto-topic pool has %d topic(s) for course=%s",
+                    len(auto_topics), payload.course_id,
                 )
 
         # ── Create the QuestionSet row ─────────────────────────────────
@@ -136,10 +165,10 @@ class PracticeService:
             per_type = max(1, math.ceil(payload.count / len(active_types)))
 
             for qtype in active_types:
-                if topics:
-                    # Further distribute per_type across matched topics.
-                    per_topic = max(1, math.ceil(per_type / len(topics)))
-                    for topic in topics:
+                if user_topics:
+                    # User picked specific topics → distribute per_type across them.
+                    per_topic = max(1, math.ceil(per_type / len(user_topics)))
+                    for topic in user_topics:
                         await self._generate_slice(
                             db,
                             qtype=qtype,
@@ -147,11 +176,28 @@ class PracticeService:
                             course_id=payload.course_id,
                             topic_id=topic.id,
                             topic_name=topic.name,
-                            difficulty=difficulty,
+                            difficulty=_pick_difficulty(),
+                            count=per_topic,
+                        )
+                elif auto_topics:
+                    # Auto-topic mode: pick exactly per_type topics from the
+                    # shuffled pool so we never generate more slices than
+                    # requested.  Each slice produces 1 question.
+                    type_topics = auto_topics[:per_type]
+                    per_topic = max(1, math.ceil(per_type / len(type_topics)))
+                    for topic in type_topics:
+                        await self._generate_slice(
+                            db,
+                            qtype=qtype,
+                            question_set_id=question_set.id,
+                            course_id=payload.course_id,
+                            topic_id=topic.id,
+                            topic_name=topic.name,
+                            difficulty=_pick_difficulty(),
                             count=per_topic,
                         )
                 else:
-                    # No topic restriction — use all course material.
+                    # No topics at all — use full course material.
                     await self._generate_slice(
                         db,
                         qtype=qtype,
@@ -159,7 +205,7 @@ class PracticeService:
                         course_id=payload.course_id,
                         topic_id=None,
                         topic_name="General",
-                        difficulty=difficulty,
+                        difficulty=_pick_difficulty(),
                         count=per_type,
                     )
         else:

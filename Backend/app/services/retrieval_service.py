@@ -176,6 +176,8 @@ class RetrievalService:
         question_type_label: str = "",
         top_k: int = 6,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
+        penalize_chunk_ids: set[uuid.UUID] | None = None,
+        generation_seed: int | None = None,
     ) -> list[RetrievedChunk]:
         """
         Slot-driven retrieval: builds a richer query seed from *topic_name* and
@@ -192,6 +194,9 @@ class RetrievalService:
         top_k              : How many chunks to return.
         exclude_chunk_ids  : Chunk IDs already used earlier in this job — will
                              be filtered out to promote diversity.
+        penalize_chunk_ids : Chunk IDs used in PREVIOUS runs — ranked last when
+                             enough fresh candidates are available.
+        generation_seed    : Integer seed for reproducible but varied tie-breaking.
         """
         query_seed = f"{topic_name} {question_type_label}".strip()
         return await self.retrieve_for_generation(
@@ -203,6 +208,8 @@ class RetrievalService:
             min_score=0.1,
             exclude_noncontent=True,
             exclude_chunk_ids=exclude_chunk_ids,
+            penalize_chunk_ids=penalize_chunk_ids,
+            generation_seed=generation_seed,
         )
 
     async def retrieve_for_generation(
@@ -216,6 +223,8 @@ class RetrievalService:
         min_score: float = 0.1,
         exclude_noncontent: bool = True,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
+        penalize_chunk_ids: set[uuid.UUID] | None = None,
+        generation_seed: int | None = None,
     ) -> list[RetrievedChunk]:
         """
         Combined retrieval for question generation, with automatic fallback broadening.
@@ -228,6 +237,13 @@ class RetrievalService:
            *exclude_noncontent* is True.
         4. Filter out chunk IDs in *exclude_chunk_ids* to promote diversity across
            a multi-slot generation job.
+        5. Penalise (rank last) chunk IDs in *penalize_chunk_ids* that belong to
+           previous runs; if enough fresh candidates exist they are excluded.
+        6. Seeded tie-break sort: when *generation_seed* is set, chunks within
+           the same 0.05 score band are shuffled with a deterministic RNG so
+           repeated runs pull different representatives of the same topic.
+        7. If the combined result after filtering has fewer than MIN_CONTEXT_CHUNKS,
+           broaden: drop topic filter, 2× top_k, lower min_score to 0.05.
         5. If the combined result after filtering has fewer than MIN_CONTEXT_CHUNKS,
            broaden: drop topic filter, 2× top_k, lower min_score to 0.05.
         6. Still below MIN_CONTEXT_CHUNKS after broadening → return empty list
@@ -334,7 +350,40 @@ class RetrievalService:
             )
             return []
 
-        combined.sort(key=lambda c: c.score, reverse=True)
+        # 5. Seeded tie-break sort: within the same 0.05 score band, shuffle
+        #    deterministically so repeated runs pull different chunk representatives.
+        if generation_seed is not None:
+            import random as _rnd
+            rng = _rnd.Random(generation_seed)
+            # Score band = floor(score * 20) / 20  (0.05 precision)
+            combined.sort(
+                key=lambda c: (round(c.score * 20) / 20, rng.random()), reverse=True
+            )
+        else:
+            combined.sort(key=lambda c: c.score, reverse=True)
+
+        # 6. Penalise historical chunk IDs: prefer chunks not used in previous
+        #    runs; fill remainder from penalised pool only when necessary.
+        if penalize_chunk_ids:
+            preferred = [c for c in combined if c.chunk_id not in penalize_chunk_ids]
+            penalised = [c for c in combined if c.chunk_id in penalize_chunk_ids]
+            if len(preferred) >= top_k:
+                # Enough fresh material — drop penalised entirely this slot.
+                combined = preferred
+                logger.debug(
+                    "retrieve_for_generation: penalised %d historical chunk(s) "
+                    "(enough fresh preferred=%d available)",
+                    len(penalised), len(preferred),
+                )
+            else:
+                # Not enough fresh; append penalised as fallback.
+                combined = preferred + penalised
+                logger.debug(
+                    "retrieve_for_generation: penalised %d chunk(s) ranked last "
+                    "(only %d fresh preferred available, need %d)",
+                    len(penalised), len(preferred), top_k,
+                )
+
         return combined[:top_k]
 
     # ------------------------------------------------------------------ #

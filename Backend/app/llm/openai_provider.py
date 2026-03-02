@@ -71,7 +71,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         self._default_max_tokens = default_max_tokens or settings.OPENAI_COMPATIBLE_MAX_TOKENS
         self._default_timeout = default_timeout or settings.OPENAI_COMPATIBLE_TIMEOUT
         # Maximum number of retries on 429 / transient errors before giving up.
-        self._max_retries: int = 5
+        self._max_retries: int = 3
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -202,8 +202,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 if wait_sec is None:
                     wait_sec = (2.0 ** attempt) + random.uniform(0.0, 1.5)
 
-                # Never wait more than 90 seconds per attempt
-                wait_sec = min(wait_sec, 90.0)
+                # Never wait more than 20 seconds per attempt before giving up to fallback
+                wait_sec = min(wait_sec, 20.0)
 
                 logger.warning(
                     "[openai_compatible] 429 rate-limited — attempt %d/%d, "

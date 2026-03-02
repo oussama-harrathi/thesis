@@ -20,8 +20,11 @@ Create {count} essay/development question(s) based on the following course mater
 --- END CONTEXT ---
 
 Difficulty level: {difficulty}
+Target Bloom level: {target_bloom}
 Topic focus: {topic}
 Suggested response length: {response_length}
+
+{non_triviality_block}
 
 Return a JSON object with this schema:
 {{

@@ -21,6 +21,25 @@ CRITICAL CONSTRAINTS — read before generating anything:
    The question must require the student to apply, analyse, or evaluate — not
    merely recall a term.  If the context only supports trivial recall, set
    insufficient_context to true.
+
+SYMBOL AND FORMATTING RULES — apply to every stem, option, and explanation:
+9. Use ONLY Unicode math symbols — never ASCII approximations or all-caps keywords:
+   ∀  (not "FORALL" or "8"),  ∃  (not "EXISTS" or "E" before a variable),
+   ∈  (not "2" or "in"),       ⊆  (not "SUBSETEQ"),    ⊂  (not "SUBSET"),
+   ⇒  (not "IMPLIES"),         ⇔  (not "IFF"),
+   ∧  (not "AND"),              ∨  (not "OR"),           ¬  (not "NOT").
+10. Do NOT use dot/slash bracket surrogates.
+    WRONG:  ".z∈x ⇔ z∈y/"
+    RIGHT:  "(z ∈ x ⇔ z ∈ y)"
+    Use ordinary parentheses ( ) for all grouping.
+11. Do NOT use ":=" in question stems or answer options to express logical
+    equivalence.  Use ⇔ instead.
+    WRONG:  "x ⊆ y := ∀z: (z ∈ x ⇒ z ∈ y)"
+    RIGHT:  "x ⊆ y ⇔ ∀z: (z ∈ x ⇒ z ∈ y)"
+    ":=" is only acceptable when literally defining a NEW symbol for the first
+    time (e.g. "Let f := x + 1") and only in the stem, never in options.
+12. Always put a space around binary symbols: write "z ∈ x", "A ⊆ B", "P ⇒ Q".
+13. Put a space after a quantifier colon: write "∀z: (phi)", not "∀z:(phi)".
 """
 
 MCQ_GENERATION_USER = """\

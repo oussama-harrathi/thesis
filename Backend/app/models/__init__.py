@@ -26,6 +26,7 @@ from app.models.question import (                                       # noqa: 
 from app.models.job import Job, JobStatus, JobType                      # noqa: F401
 from app.models.exam import ExamBlueprint, Exam, ExamQuestion           # noqa: F401
 from app.models.export import Export, ExportType, ExportStatus          # noqa: F401
+from app.models.blacklist import QuestionBlacklist                      # noqa: F401
 
 __all__ = [
     # core
@@ -59,4 +60,6 @@ __all__ = [
     "Export",
     "ExportType",
     "ExportStatus",
+    # diversity / blacklist
+    "QuestionBlacklist",
 ]

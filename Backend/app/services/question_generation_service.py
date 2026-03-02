@@ -5,12 +5,11 @@ Responsible for generating exam questions using the LLM provider and
 persisting them to the database with full traceability (source chunks,
 model metadata).
 
-Currently supported types:
-  - MCQ        (multiple-choice, 4 options, exactly 1 correct)
-  - True/False (declarative statement + boolean answer)
-
-Phase 7 stubs:
-  - generate_short_answer / generate_essay  (later)
+Supported types:
+  - MCQ             (multiple-choice, 4 options, exactly 1 correct)
+  - True/False      (declarative statement + boolean answer)
+  - Short Answer    (question + model answer + key grading points)
+  - Essay           (open-ended prompt + model outline + rubric)
 
 Generation flow for generate_mcq() and generate_true_false():
   1. Retrieve relevant chunks from pgvector via RetrievalService.
@@ -34,6 +33,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.llm.base import BaseLLMProvider, GenerationSettings
 from app.llm.factory import get_llm_provider
+from app.llm.prompts.essay_generation import (
+    ESSAY_GENERATION_SYSTEM,
+    ESSAY_GENERATION_USER,
+)
 from app.llm.prompts.mcq_generation import MCQ_GENERATION_SYSTEM, MCQ_GENERATION_USER
 from app.llm.prompts.short_answer_generation import (
     SHORT_ANSWER_GENERATION_SYSTEM,
@@ -49,6 +52,8 @@ from app.models.question import (
     QuestionType,
 )
 from app.schemas.llm_outputs import (
+    EssayGenerationOutput,
+    EssayQuestionOutput,
     MCQGenerationOutput,
     MCQQuestionOutput,
     ShortAnswerGenerationOutput,
@@ -57,17 +62,19 @@ from app.schemas.llm_outputs import (
     TFQuestionOutput,
 )
 from app.services.context_builder import ContextBuilder
+from app.services.diversity_service import DiversityContext, DiversityService
 from app.services.retrieval_service import MIN_CONTEXT_CHUNKS, RetrievalService, RetrievedChunk
 from app.services.validation_service import CorrectnessResult, ValidationService
 from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_duplicate_question, should_reject_trivial
-from app.utils.text_normalization import normalize_logic_symbols
+from app.utils.text_normalization import normalize_mcs_notation
 
 logger = logging.getLogger(__name__)
 
 # Bump these strings whenever the corresponding prompt templates change.
-MCQ_PROMPT_VERSION = "mcq-v3"
+MCQ_PROMPT_VERSION = "mcq-v4"
 TF_PROMPT_VERSION = "tf-v3"
 SA_PROMPT_VERSION = "sa-v2"
+ESSAY_PROMPT_VERSION = "essay-v1"
 
 
 class QuestionGenerationService:
@@ -82,11 +89,13 @@ class QuestionGenerationService:
         self,
         provider: BaseLLMProvider | None = None,
         retrieval_service: RetrievalService | None = None,
+        diversity_service: DiversityService | None = None,
     ) -> None:
         # Allow injection for tests; fall back to factory / defaults at runtime.
         self._provider: BaseLLMProvider = provider or get_llm_provider()
         self._retrieval: RetrievalService = retrieval_service or RetrievalService()
         self._validation_svc = ValidationService()
+        self._diversity_svc: DiversityService = diversity_service or DiversityService()
 
     # ------------------------------------------------------------------ #
     # MCQ Generation                                                       #
@@ -109,6 +118,9 @@ class QuestionGenerationService:
         _out_chunk_ids: list[uuid.UUID] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
+        diversity_ctx: DiversityContext | None = None,
+        generation_seed: int | None = None,
+        penalize_chunk_ids: set[uuid.UUID] | None = None,
     ) -> list[Question]:
         """
         Generate *count* MCQ question(s) grounded in the course material.
@@ -142,6 +154,8 @@ class QuestionGenerationService:
             top_k=top_k_chunks,
             min_score=0.1,
             exclude_chunk_ids=exclude_chunk_ids,
+            penalize_chunk_ids=penalize_chunk_ids,
+            generation_seed=generation_seed,
         )
 
         logger.info(
@@ -213,15 +227,15 @@ class QuestionGenerationService:
         # ── 5–7. Persist questions + options + sources ─────────────────
         saved: list[Question] = []
         for q_output in output.questions:
-            # B) Normalize math/logic symbol artifacts in all text fields.
+            # B) Normalize MCS / math-symbol artifacts in all text fields.
             q_output = q_output.model_copy(update={
-                "stem": normalize_logic_symbols(q_output.stem),
+                "stem": normalize_mcs_notation(q_output.stem),
                 "options": [
-                    opt.model_copy(update={"text": normalize_logic_symbols(opt.text)})
+                    opt.model_copy(update={"text": normalize_mcs_notation(opt.text)})
                     for opt in q_output.options
                 ],
                 "explanation": (
-                    normalize_logic_symbols(q_output.explanation)
+                    normalize_mcs_notation(q_output.explanation)
                     if q_output.explanation else None
                 ),
             })
@@ -249,6 +263,39 @@ class QuestionGenerationService:
                     difficulty, bloom, q_output.stem[:80],
                 )
                 continue
+
+            # ── Diversity checks: fingerprint + embedding ──────────────
+            q_fp = self._diversity_svc.compute_fingerprint(q_output.stem)
+            try:
+                q_emb = await self._diversity_svc.compute_embedding(q_output.stem)
+            except Exception as _emb_exc:
+                logger.warning(
+                    "generate_mcq: embedding failed (%s) — diversity checks skipped",
+                    _emb_exc,
+                )
+                q_emb = []
+
+            if diversity_ctx is not None and q_emb:
+                _bl, _bl_reason = self._diversity_svc.is_blacklisted(
+                    q_output.stem, q_emb, diversity_ctx
+                )
+                if _bl:
+                    diversity_ctx.blacklist_avoided += 1
+                    logger.warning(
+                        "generate_mcq: BLACKLISTED (%s) stem=%r — skipping",
+                        _bl_reason, q_output.stem[:80],
+                    )
+                    continue
+                _rd, _rd_reason = self._diversity_svc.is_recent_duplicate(
+                    q_output.stem, q_emb, diversity_ctx
+                )
+                if _rd:
+                    diversity_ctx.dedup_avoided += 1
+                    logger.warning(
+                        "generate_mcq: RECENT_DUPLICATE (%s) stem=%r — skipping",
+                        _rd_reason, q_output.stem[:80],
+                    )
+                    continue
 
             # A) Pre-persist MCQ correctness verification.
             mcq_correctness: CorrectnessResult | None = None
@@ -290,6 +337,9 @@ class QuestionGenerationService:
                     difficulty=difficulty,
                     chunks=chunks,
                     insufficient_context=False,
+                    fingerprint=q_fp,
+                    embedding=q_emb if q_emb else None,
+                    generation_run_id=question_set_id,
                 )
                 saved.append(question)
                 if used_question_stems is not None:
@@ -403,10 +453,12 @@ class QuestionGenerationService:
                     exc,
                 )
 
-        # 3. Difficulty tagging
+        # 3. Difficulty tagging — heuristic only.
+        #    The generation LLM already embedded difficulty in the question JSON;
+        #    a second LLM re-classification wastes 2 Gemini calls per question.
         try:
             await self._validation_svc.tag_difficulty(
-                db, question, provider=self._provider
+                db, question, provider=None
             )
         except Exception as exc:
             logger.warning(
@@ -415,10 +467,10 @@ class QuestionGenerationService:
                 exc,
             )
 
-        # 4. Bloom taxonomy tagging
+        # 4. Bloom taxonomy tagging — heuristic only (same reason as above).
         try:
             await self._validation_svc.tag_bloom(
-                db, question, provider=self._provider
+                db, question, provider=None
             )
         except Exception as exc:
             logger.warning(
@@ -475,6 +527,9 @@ class QuestionGenerationService:
         _out_chunk_ids: list[uuid.UUID] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
+        diversity_ctx: DiversityContext | None = None,
+        generation_seed: int | None = None,
+        penalize_chunk_ids: set[uuid.UUID] | None = None,
     ) -> list[Question]:
         """
         Generate *count* True/False question(s) grounded in the course material.
@@ -496,6 +551,8 @@ class QuestionGenerationService:
             top_k=top_k_chunks,
             min_score=0.1,
             exclude_chunk_ids=exclude_chunk_ids,
+            penalize_chunk_ids=penalize_chunk_ids,
+            generation_seed=generation_seed,
         )
 
         logger.info(
@@ -564,11 +621,11 @@ class QuestionGenerationService:
         # ── 5–6. Persist questions + sources (no options for TF) ───────
         saved: list[Question] = []
         for q_output in output.questions:
-            # B) Normalize math/logic symbol artifacts.
+            # B) Normalize MCS / math-symbol artifacts.
             q_output = q_output.model_copy(update={
-                "statement": normalize_logic_symbols(q_output.statement),
+                "statement": normalize_mcs_notation(q_output.statement),
                 "explanation": (
-                    normalize_logic_symbols(q_output.explanation)
+                    normalize_mcs_notation(q_output.explanation)
                     if q_output.explanation else None
                 ),
             })
@@ -589,6 +646,39 @@ class QuestionGenerationService:
                     difficulty, bloom, q_output.statement[:80],
                 )
                 continue
+
+            # ── Diversity checks: fingerprint + embedding ──────────────────
+            tf_fp = self._diversity_svc.compute_fingerprint(q_output.statement)
+            try:
+                tf_emb = await self._diversity_svc.compute_embedding(q_output.statement)
+            except Exception as _emb_exc:
+                logger.warning(
+                    "generate_true_false: embedding failed (%s) — diversity checks skipped",
+                    _emb_exc,
+                )
+                tf_emb = []
+
+            if diversity_ctx is not None and tf_emb:
+                _bl, _bl_reason = self._diversity_svc.is_blacklisted(
+                    q_output.statement, tf_emb, diversity_ctx
+                )
+                if _bl:
+                    diversity_ctx.blacklist_avoided += 1
+                    logger.warning(
+                        "generate_true_false: BLACKLISTED (%s) statement=%r — skipping",
+                        _bl_reason, q_output.statement[:80],
+                    )
+                    continue
+                _rd, _rd_reason = self._diversity_svc.is_recent_duplicate(
+                    q_output.statement, tf_emb, diversity_ctx
+                )
+                if _rd:
+                    diversity_ctx.dedup_avoided += 1
+                    logger.warning(
+                        "generate_true_false: RECENT_DUPLICATE (%s) statement=%r — skipping",
+                        _rd_reason, q_output.statement[:80],
+                    )
+                    continue
 
             # A) Pre-persist TF correctness verification.
             tf_correctness: CorrectnessResult | None = None
@@ -630,6 +720,9 @@ class QuestionGenerationService:
                     difficulty=difficulty,
                     chunks=chunks,
                     insufficient_context=False,
+                    fingerprint=tf_fp,
+                    embedding=tf_emb if tf_emb else None,
+                    generation_run_id=question_set_id,
                 )
                 saved.append(question)
                 if used_question_stems is not None:
@@ -673,6 +766,9 @@ class QuestionGenerationService:
         _out_chunk_ids: list[uuid.UUID] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
+        diversity_ctx: DiversityContext | None = None,
+        generation_seed: int | None = None,
+        penalize_chunk_ids: set[uuid.UUID] | None = None,
     ) -> list[Question]:
         """
         Generate *count* Short Answer question(s) grounded in the course material.
@@ -695,6 +791,8 @@ class QuestionGenerationService:
             top_k=top_k_chunks,
             min_score=0.1,
             exclude_chunk_ids=exclude_chunk_ids,
+            penalize_chunk_ids=penalize_chunk_ids,
+            generation_seed=generation_seed,
         )
 
         logger.info(
@@ -768,12 +866,12 @@ class QuestionGenerationService:
         # ── 5. Persist questions + sources ─────────────────────────────
         saved: list[Question] = []
         for q_output in output.questions:
-            # B) Normalize math/logic symbol artifacts.
+            # B) Normalize MCS / math-symbol artifacts.
             q_output = q_output.model_copy(update={
-                "question":     normalize_logic_symbols(q_output.question or ""),
-                "model_answer": normalize_logic_symbols(q_output.model_answer or ""),
+                "question":     normalize_mcs_notation(q_output.question or ""),
+                "model_answer": normalize_mcs_notation(q_output.model_answer or ""),
                 "key_points": [
-                    normalize_logic_symbols(kp) for kp in (q_output.key_points or [])
+                    normalize_mcs_notation(kp) for kp in (q_output.key_points or [])
                 ],
             })
 
@@ -803,6 +901,40 @@ class QuestionGenerationService:
                     difficulty, bloom, q_output.question[:80],
                 )
                 continue
+
+            # ── Diversity checks: fingerprint + embedding ──────────────────
+            sa_fp = self._diversity_svc.compute_fingerprint(q_output.question)
+            try:
+                sa_emb = await self._diversity_svc.compute_embedding(q_output.question)
+            except Exception as _emb_exc:
+                logger.warning(
+                    "generate_short_answer: embedding failed (%s) — diversity checks skipped",
+                    _emb_exc,
+                )
+                sa_emb = []
+
+            if diversity_ctx is not None and sa_emb:
+                _bl, _bl_reason = self._diversity_svc.is_blacklisted(
+                    q_output.question, sa_emb, diversity_ctx
+                )
+                if _bl:
+                    diversity_ctx.blacklist_avoided += 1
+                    logger.warning(
+                        "generate_short_answer: BLACKLISTED (%s) q=%r — skipping",
+                        _bl_reason, q_output.question[:80],
+                    )
+                    continue
+                _rd, _rd_reason = self._diversity_svc.is_recent_duplicate(
+                    q_output.question, sa_emb, diversity_ctx
+                )
+                if _rd:
+                    diversity_ctx.dedup_avoided += 1
+                    logger.warning(
+                        "generate_short_answer: RECENT_DUPLICATE (%s) q=%r — skipping",
+                        _rd_reason, q_output.question[:80],
+                    )
+                    continue
+
             try:
                 question = await self._persist_sa_question(
                     db,
@@ -810,6 +942,9 @@ class QuestionGenerationService:
                     question_set_id=question_set_id,
                     difficulty=difficulty,
                     chunks=chunks,
+                    fingerprint=sa_fp,
+                    embedding=sa_emb if sa_emb else None,
+                    generation_run_id=question_set_id,
                 )
                 saved.append(question)
                 if used_question_stems is not None:
@@ -831,6 +966,220 @@ class QuestionGenerationService:
         return saved
 
     # ------------------------------------------------------------------ #
+    # Essay Generation                                                     #
+    # ------------------------------------------------------------------ #
+
+    async def generate_essay(
+        self,
+        db: AsyncSession,
+        *,
+        question_set_id: uuid.UUID,
+        course_id: uuid.UUID,
+        topic_id: uuid.UUID | None = None,
+        topic_name: str = "General",
+        difficulty: str = "medium",
+        count: int = 1,
+        top_k_chunks: int = 8,
+        retrieval_query: str | None = None,
+        generation_settings: GenerationSettings | None = None,
+        exclude_chunk_ids: set[uuid.UUID] | None = None,
+        _out_chunk_ids: list[uuid.UUID] | None = None,
+        used_question_stems: list[str] | None = None,
+        target_bloom: str | None = None,
+        diversity_ctx: DiversityContext | None = None,
+        generation_seed: int | None = None,
+        penalize_chunk_ids: set[uuid.UUID] | None = None,
+    ) -> list[Question]:
+        """
+        Generate *count* Essay/Development question(s) grounded in course material.
+
+        Each question has a ``body`` (the question prompt), a ``correct_answer``
+        (model outline), and an ``explanation`` (student guidance + rubric summary).
+
+        Returns
+        -------
+        List of persisted Question objects (may be empty if context is
+        insufficient or grounding validation fails).
+        """
+        # ── 1. Retrieve context chunks ─────────────────────────────────
+        query = retrieval_query or topic_name
+        chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
+            db,
+            query=query,
+            topic_id=topic_id,
+            course_id=course_id,
+            top_k=top_k_chunks,
+            min_score=0.1,
+            exclude_chunk_ids=exclude_chunk_ids,
+            penalize_chunk_ids=penalize_chunk_ids,
+            generation_seed=generation_seed,
+        )
+
+        logger.info(
+            "generate_essay: retrieved %d chunks for course=%s topic=%r "
+            "topic_id=%s (min_required=%d) context_chars=%d",
+            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            sum(len(c.content) for c in chunks),
+        )
+
+        if _out_chunk_ids is not None:
+            _out_chunk_ids.extend(c.chunk_id for c in chunks)
+
+        if not chunks:
+            logger.warning(
+                "generate_essay: SKIP — 0 chunks after fallback for "
+                "course=%s topic=%r",
+                course_id, topic_name,
+            )
+            return []
+
+        # ── 2. Build prompt ────────────────────────────────────────────
+        bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        context_text = ContextBuilder.build(chunks)
+        prompt = self._build_essay_prompt(
+            context=context_text,
+            topic=topic_name,
+            difficulty=difficulty,
+            count=count,
+            target_bloom=bloom,
+        )
+
+        # ── 3. Call LLM ────────────────────────────────────────────────
+        logger.info(
+            "generate_essay: calling LLM provider=%s count=%d topic=%r "
+            "difficulty=%s context_chunks=%d",
+            self._provider.provider_name, count, topic_name, difficulty, len(chunks),
+        )
+        try:
+            output: EssayGenerationOutput = await self._provider.generate_json(
+                prompt,
+                EssayGenerationOutput,
+                generation_settings,
+            )
+        except Exception as exc:
+            logger.error(
+                "generate_essay: LLM call failed for course=%s topic=%r: %s",
+                course_id, topic_name, exc, exc_info=True,
+            )
+            return []
+
+        # ── 4. Hard grounding gate ─────────────────────────────────────
+        if output.insufficient_context:
+            logger.warning(
+                "generate_essay: LLM returned insufficient_context=True for "
+                "course=%s topic=%r — discarding %d question(s) to prevent hallucination",
+                course_id, topic_name, len(output.questions),
+            )
+            return []
+
+        if not output.questions:
+            logger.warning(
+                "generate_essay: LLM returned 0 questions for course=%s topic=%r",
+                course_id, topic_name,
+            )
+            return []
+
+        # ── 5. Persist questions + sources ─────────────────────────────
+        saved: list[Question] = []
+        for q_output in output.questions:
+            # Normalize MCS / math-symbol artifacts.
+            q_output = q_output.model_copy(update={
+                "question":     normalize_mcs_notation(q_output.question or ""),
+                "model_outline": normalize_mcs_notation(q_output.model_outline or ""),
+                "guidance": (
+                    normalize_mcs_notation(q_output.guidance)
+                    if q_output.guidance else None
+                ),
+            })
+
+            if not q_output.question or not q_output.question.strip():
+                logger.warning("generate_essay: empty question text — skipping")
+                continue
+            if not q_output.model_outline or not q_output.model_outline.strip():
+                logger.warning("generate_essay: empty model_outline — skipping")
+                continue
+
+            # Duplicate detection across current job.
+            if used_question_stems is not None:
+                is_dup, sim = is_duplicate_question(q_output.question, used_question_stems)
+                if is_dup:
+                    logger.warning(
+                        "generate_essay: DUPLICATE detected (sim=%.2f) q=%r — skipping",
+                        sim, q_output.question[:80],
+                    )
+                    continue
+
+            # Triviality guard (essays at medium/hard must not be recall-only).
+            if should_reject_trivial(q_output.question, difficulty, bloom):
+                logger.warning(
+                    "generate_essay: TRIVIAL for %s/%s — skipping q=%r",
+                    difficulty, bloom, q_output.question[:80],
+                )
+                continue
+
+            # ── Diversity checks: fingerprint + embedding ──────────────────
+            es_fp = self._diversity_svc.compute_fingerprint(q_output.question)
+            try:
+                es_emb = await self._diversity_svc.compute_embedding(q_output.question)
+            except Exception as _emb_exc:
+                logger.warning(
+                    "generate_essay: embedding failed (%s) — diversity checks skipped",
+                    _emb_exc,
+                )
+                es_emb = []
+
+            if diversity_ctx is not None and es_emb:
+                _bl, _bl_reason = self._diversity_svc.is_blacklisted(
+                    q_output.question, es_emb, diversity_ctx
+                )
+                if _bl:
+                    diversity_ctx.blacklist_avoided += 1
+                    logger.warning(
+                        "generate_essay: BLACKLISTED (%s) q=%r — skipping",
+                        _bl_reason, q_output.question[:80],
+                    )
+                    continue
+                _rd, _rd_reason = self._diversity_svc.is_recent_duplicate(
+                    q_output.question, es_emb, diversity_ctx
+                )
+                if _rd:
+                    diversity_ctx.dedup_avoided += 1
+                    logger.warning(
+                        "generate_essay: RECENT_DUPLICATE (%s) q=%r — skipping",
+                        _rd_reason, q_output.question[:80],
+                    )
+                    continue
+
+            try:
+                question = await self._persist_essay_question(
+                    db,
+                    q_output=q_output,
+                    question_set_id=question_set_id,
+                    difficulty=difficulty,
+                    chunks=chunks,
+                    fingerprint=es_fp,
+                    embedding=es_emb if es_emb else None,
+                    generation_run_id=question_set_id,
+                )
+                saved.append(question)
+                if used_question_stems is not None:
+                    used_question_stems.append(q_output.question)
+                await self._run_validators(db, question, is_mcq=False,
+                                           target_difficulty=difficulty, target_bloom=bloom)
+            except Exception as exc:
+                logger.error(
+                    "generate_essay: failed to persist question=%r: %s",
+                    q_output.question[:60], exc, exc_info=True,
+                )
+                continue
+
+        logger.info(
+            "generate_essay: saved %d/%d essay question(s) for course=%s topic=%r",
+            len(saved), len(output.questions), course_id, topic_name,
+        )
+        return saved
+
+    # ------------------------------------------------------------------ #
     # Internal persistence helpers                                         #
     # ------------------------------------------------------------------ #
 
@@ -843,6 +1192,9 @@ class QuestionGenerationService:
         difficulty: str,
         chunks: list[RetrievedChunk],
         insufficient_context: bool,
+        fingerprint: str | None = None,
+        embedding: list[float] | None = None,
+        generation_run_id: uuid.UUID | None = None,
     ) -> Question:
         """
         Insert one MCQ Question row, its McqOption rows, and QuestionSource rows.
@@ -875,6 +1227,9 @@ class QuestionGenerationService:
             model_name=self._provider.provider_name,
             prompt_version=MCQ_PROMPT_VERSION,
             insufficient_context=insufficient_context,
+            fingerprint=fingerprint,
+            embedding=embedding,
+            generation_run_id=generation_run_id,
         )
         db.add(question)
 
@@ -912,6 +1267,9 @@ class QuestionGenerationService:
         difficulty: str,
         chunks: list[RetrievedChunk],
         insufficient_context: bool,
+        fingerprint: str | None = None,
+        embedding: list[float] | None = None,
+        generation_run_id: uuid.UUID | None = None,
     ) -> Question:
         """
         Insert one True/False Question row and its QuestionSource rows.
@@ -945,6 +1303,9 @@ class QuestionGenerationService:
             model_name=self._provider.provider_name,
             prompt_version=TF_PROMPT_VERSION,
             insufficient_context=insufficient_context,
+            fingerprint=fingerprint,
+            embedding=embedding,
+            generation_run_id=generation_run_id,
         )
         db.add(question)
 
@@ -969,6 +1330,9 @@ class QuestionGenerationService:
         question_set_id: uuid.UUID,
         difficulty: str,
         chunks: list[RetrievedChunk],
+        fingerprint: str | None = None,
+        embedding: list[float] | None = None,
+        generation_run_id: uuid.UUID | None = None,
     ) -> Question:
         """
         Insert one Short Answer Question row and its QuestionSource rows.
@@ -1006,6 +1370,77 @@ class QuestionGenerationService:
             model_name=self._provider.provider_name,
             prompt_version=SA_PROMPT_VERSION,
             insufficient_context=False,
+            fingerprint=fingerprint,
+            embedding=embedding,
+            generation_run_id=generation_run_id,
+        )
+        db.add(question)
+        await db.flush()
+
+        await self._persist_sources(
+            db,
+            question=question,
+            source_hint=q_output.source_hint,
+            chunks=chunks,
+        )
+
+        return question
+
+    async def _persist_essay_question(
+        self,
+        db: AsyncSession,
+        *,
+        q_output: EssayQuestionOutput,
+        question_set_id: uuid.UUID,
+        difficulty: str,
+        chunks: list[RetrievedChunk],
+        fingerprint: str | None = None,
+        embedding: list[float] | None = None,
+        generation_run_id: uuid.UUID | None = None,
+    ) -> Question:
+        """
+        Insert one Essay Question row and its QuestionSource rows.
+
+        Storage conventions:
+          body           — the essay prompt shown to the student
+          correct_answer — the model outline (ideal answer structure)
+          explanation    — student guidance; if absent, rubric criteria joined
+        """
+        try:
+            difficulty_enum = Difficulty(difficulty.lower())
+        except ValueError:
+            logger.warning(
+                "_persist_essay_question: unknown difficulty %r, defaulting to medium",
+                difficulty,
+            )
+            difficulty_enum = Difficulty.medium
+
+        # Build explanation: prefer guidance; fall back to rubric summary.
+        if q_output.guidance and q_output.guidance.strip():
+            explanation = q_output.guidance
+        elif q_output.rubric:
+            explanation = "; ".join(
+                f"{r.criterion} ({r.max_points} pts): {r.description}"
+                for r in q_output.rubric
+            )
+        else:
+            explanation = None
+
+        question = Question(
+            id=uuid.uuid4(),
+            question_set_id=question_set_id,
+            type=QuestionType.essay,
+            body=q_output.question,
+            correct_answer=q_output.model_outline,
+            explanation=explanation,
+            difficulty=difficulty_enum,
+            status=QuestionStatus.draft,
+            model_name=self._provider.provider_name,
+            prompt_version=ESSAY_PROMPT_VERSION,
+            insufficient_context=False,
+            fingerprint=fingerprint,
+            embedding=embedding,
+            generation_run_id=generation_run_id,
         )
         db.add(question)
         await db.flush()
@@ -1180,3 +1615,33 @@ class QuestionGenerationService:
             non_triviality_block=non_trivial_block,
         )
         return f"{TF_GENERATION_SYSTEM}\n---\n{user_section}"
+
+    @staticmethod
+    def _build_essay_prompt(
+        *,
+        context: str,
+        topic: str,
+        difficulty: str,
+        count: int,
+        target_bloom: str = "analyze",
+    ) -> str:
+        """Combine the Essay system + user messages into a single prompt string."""
+        _response_length_map = {
+            "easy":   "200–300 words",
+            "medium": "400–600 words",
+            "hard":   "600–900 words",
+        }
+        response_length = _response_length_map.get(difficulty.lower(), "400–600 words")
+        non_trivial_block = QuestionGenerationService._build_non_triviality_block(
+            difficulty, target_bloom
+        )
+        user_section = ESSAY_GENERATION_USER.format(
+            context=context,
+            topic=topic,
+            difficulty=difficulty,
+            count=count,
+            target_bloom=target_bloom,
+            response_length=response_length,
+            non_triviality_block=non_trivial_block,
+        )
+        return f"{ESSAY_GENERATION_SYSTEM}\n---\n{user_section}"

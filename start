@@ -1,7 +1,8 @@
 Start worker:
 # Terminal 2 — Celery worker
 cd "D:\Miskolc Thesis\Backend"
-& "d:\Miskolc Thesis\.venv\Scripts\python.exe" -m celery -A app.workers.celery_app worker --loglevel=info --pool=solo
+# --without-gossip --without-mingle: skip cluster handshakes so Ctrl+C exits faster
+& "d:\Miskolc Thesis\.venv\Scripts\python.exe" -m celery -A app.workers.celery_app worker --loglevel=info --pool=solo --without-gossip --without-mingle
 
 start backend:
 # Terminal 1 — Backend

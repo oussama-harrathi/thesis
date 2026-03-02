@@ -278,7 +278,7 @@ MCQ_MOCK_RESPONSE: dict = {
     "insufficient_context": False,
     "questions": [
         {
-            "stem": "What is the primary function of chlorophyll in photosynthesis?",
+            "stem": "How does chlorophyll enable the capture of light energy during photosynthesis?",
             "options": [
                 {
                     "key": "A",

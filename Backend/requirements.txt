@@ -25,7 +25,7 @@ sentence-transformers>=2.6,<4
 pgvector>=0.2,<1
 # ── LLM providers ──────────────────────────────────────────────
 # httpx is already listed above (used by providers + httpx tests)
-google-generativeai>=0.7,<1   # Gemini provider
+google-genai>=0.8,<2           # Gemini provider (new SDK)
 # ── LaTeX templating ────────────────────────────────────────────
 Jinja2>=3.1,<4
 

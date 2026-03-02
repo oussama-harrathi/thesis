@@ -10,6 +10,16 @@ openai_compatible   OpenAICompatibleProvider  (Groq, OpenRouter, OpenAI, …)
 gemini              GeminiProvider            (Google Gemini via AI Studio)
 ollama              OllamaProvider            (local Ollama instance)
 mock                MockProvider              (deterministic, no API calls)
+
+Fallback
+────────
+Set LLM_FALLBACK_PROVIDER to any supported value to enable automatic
+fallback: when the primary provider exhausts all retries (LLMProviderError),
+the same call is transparently re-attempted using the fallback provider.
+
+Example:
+    LLM_PROVIDER=openai_compatible   # Groq
+    LLM_FALLBACK_PROVIDER=gemini     # Google Gemini as fallback
 """
 
 from __future__ import annotations
@@ -30,9 +40,29 @@ _PROVIDER_MAP = {
 }
 
 
+def _instantiate_provider(provider_key: str) -> BaseLLMProvider:
+    """Resolve and instantiate a provider by its registry key."""
+    key = provider_key.lower().strip()
+    if key not in _PROVIDER_MAP:
+        supported = ", ".join(sorted(_PROVIDER_MAP.keys()))
+        raise ValueError(
+            f"Unsupported provider key {key!r}. Supported values: {supported}"
+        )
+    dotted_path = _PROVIDER_MAP[key]
+    module_path, class_name = dotted_path.rsplit(".", 1)
+    import importlib
+    module = importlib.import_module(module_path)
+    provider_class: type[BaseLLMProvider] = getattr(module, class_name)
+    return provider_class()
+
+
 def get_llm_provider() -> BaseLLMProvider:
     """
     Instantiate and return the LLM provider selected by ``LLM_PROVIDER``.
+
+    When ``LLM_FALLBACK_PROVIDER`` is also set, returns a ``FallbackProvider``
+    that wraps the primary provider and transparently retries using the
+    fallback when the primary raises ``LLMProviderError``.
 
     The provider is freshly instantiated on each call (no singleton).
     For long-lived use-cases (e.g. a request lifespan) the caller should
@@ -40,25 +70,21 @@ def get_llm_provider() -> BaseLLMProvider:
 
     Raises
     ------
-    ValueError  : if LLM_PROVIDER is set to an unsupported value.
-    ImportError : if the provider's required SDK is not installed
-                  (e.g. google-generativeai for gemini).
+    ValueError  : if LLM_PROVIDER or LLM_FALLBACK_PROVIDER is unsupported.
+    ImportError : if a provider's required SDK is not installed.
     """
     provider_key = settings.LLM_PROVIDER.lower().strip()
+    primary = _instantiate_provider(provider_key)
+    logger.info("LLM primary provider: %s", provider_key)
 
-    if provider_key not in _PROVIDER_MAP:
-        supported = ", ".join(sorted(_PROVIDER_MAP.keys()))
-        raise ValueError(
-            f"Unsupported LLM_PROVIDER={provider_key!r}. "
-            f"Supported values: {supported}"
+    fallback_key = (settings.LLM_FALLBACK_PROVIDER or "").lower().strip()
+    if fallback_key:
+        fallback = _instantiate_provider(fallback_key)
+        logger.info(
+            "LLM fallback provider: %s (active after primary exhausts retries)",
+            fallback_key,
         )
+        from app.llm.fallback_provider import FallbackProvider
+        return FallbackProvider(primary=primary, fallback=fallback)
 
-    dotted_path = _PROVIDER_MAP[provider_key]
-    module_path, class_name = dotted_path.rsplit(".", 1)
-
-    import importlib
-    module = importlib.import_module(module_path)
-    provider_class: type[BaseLLMProvider] = getattr(module, class_name)
-
-    logger.info("LLM provider: %s (%s)", provider_key, dotted_path)
-    return provider_class()
+    return primary

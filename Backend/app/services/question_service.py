@@ -20,6 +20,7 @@ from app.models.question import (
     Difficulty,
     McqOption,
     Question,
+    QuestionSet,
     QuestionStatus,
     QuestionType,
 )
@@ -222,7 +223,7 @@ class QuestionService:
         payload: "RejectRequest | None" = None,
     ) -> Question:
         """
-        Set question status to ``rejected``.
+        Set question status to ``rejected`` and add it to the course blacklist.
 
         If *payload.reason* is provided it is appended to (or replaces) the
         question's explanation field for traceability.
@@ -234,10 +235,31 @@ class QuestionService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Question {question.id} is already rejected.",
             )
+        reason = payload.reason if payload and payload.reason else None
         question.status = QuestionStatus.rejected
-        if payload and payload.reason:
-            question.explanation = payload.reason
+        if reason:
+            question.explanation = reason
         self._db.add(question)
         await self._db.flush()
         logger.info("QuestionService.reject: question=%s", question.id)
+
+        # ── Blacklist insertion ───────────────────────────────────────
+        # Resolve course_id through the parent QuestionSet.
+        try:
+            qs = await self._db.get(QuestionSet, question.question_set_id)
+            if qs is not None:
+                from app.services.diversity_service import DiversityService
+                await DiversityService().add_to_blacklist(
+                    self._db,
+                    course_id=qs.course_id,
+                    question=question,
+                    reason=reason,
+                )
+        except Exception as exc:
+            # Non-fatal: rejection must always succeed even if blacklist write fails.
+            logger.warning(
+                "QuestionService.reject: blacklist insertion failed for question=%s: %s",
+                question.id, exc,
+            )
+
         return question
