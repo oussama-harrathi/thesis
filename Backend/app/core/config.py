@@ -43,8 +43,20 @@ class Settings(BaseSettings):
 
     # ── Fallback provider ──────────────────────────────────────────────
     # When set, a failed primary call is retried using this provider.
-    # Supported values: gemini | openai_compatible | ollama | mock | "" (disabled)
+    # Supported values: cerebras | gemini | openai_compatible | ollama | mock | "" (disabled)
     LLM_FALLBACK_PROVIDER: str = ""
+
+    # Optional second fallback (tertiary).  When set, the chain is:
+    #   primary → LLM_FALLBACK_PROVIDER → LLM_SECOND_FALLBACK_PROVIDER
+    LLM_SECOND_FALLBACK_PROVIDER: str = ""
+
+    # ── Cerebras provider ──────────────────────────────────────────────
+    CEREBRAS_API_KEY: str = ""
+    CEREBRAS_BASE_URL: str = "https://api.cerebras.ai/v1"
+    CEREBRAS_MODEL: str = "llama3.1-8b"
+    CEREBRAS_TEMPERATURE: float = 0.3
+    CEREBRAS_MAX_TOKENS: int = 2048
+    CEREBRAS_TIMEOUT: float = 60.0
 
     # ── Gemini provider ──────────────────────────────────────────────
     GEMINI_API_KEY: str = ""

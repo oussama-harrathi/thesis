@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # Registry: provider name → import path (lazy to avoid importing heavy SDKs at startup)
 _PROVIDER_MAP = {
     "openai_compatible": "app.llm.openai_provider.OpenAICompatibleProvider",
+    "cerebras": "app.llm.cerebras_provider.CerebrasProvider",
     "gemini": "app.llm.gemini_provider.GeminiProvider",
     "ollama": "app.llm.ollama_provider.OllamaProvider",
     "mock": "app.llm.mock_provider.MockProvider",
@@ -78,8 +79,22 @@ def get_llm_provider() -> BaseLLMProvider:
     logger.info("LLM primary provider: %s", provider_key)
 
     fallback_key = (settings.LLM_FALLBACK_PROVIDER or "").lower().strip()
+    second_fallback_key = (settings.LLM_SECOND_FALLBACK_PROVIDER or "").lower().strip()
+
     if fallback_key:
         fallback = _instantiate_provider(fallback_key)
+        if second_fallback_key:
+            # Chain: primary → fallback → second_fallback
+            # Achieved by nesting: FallbackProvider(fallback, second_fallback)
+            # so when fallback also fails, the inner FallbackProvider tries second_fallback.
+            second_fallback = _instantiate_provider(second_fallback_key)
+            from app.llm.fallback_provider import FallbackProvider
+            inner = FallbackProvider(primary=fallback, fallback=second_fallback)
+            logger.info(
+                "LLM fallback chain: %s → %s → %s",
+                provider_key, fallback_key, second_fallback_key,
+            )
+            return FallbackProvider(primary=primary, fallback=inner)
         logger.info(
             "LLM fallback provider: %s (active after primary exhausts retries)",
             fallback_key,
