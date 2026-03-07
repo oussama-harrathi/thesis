@@ -121,6 +121,12 @@ class ExamAssemblyService:
             len(questions),
         )
 
+        if not questions:
+            raise ValueError(
+                "No approved questions found for this blueprint. "
+                "Please go to Question Review and approve some questions first."
+            )
+
         # ── Calculate total_points ────────────────────────────────
         pts = payload.default_points_per_question
         total_points: int | None = None

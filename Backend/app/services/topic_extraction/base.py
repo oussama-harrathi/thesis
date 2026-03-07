@@ -29,9 +29,9 @@ METHOD_EMBEDDING_CLUSTERS  = "EMBEDDING_CLUSTERS"
 
 # ── Sanity-check thresholds (configurable) ────────────────────────────────────
 
-SANITY_MIN_TOPICS:        int   = 5
+SANITY_MIN_TOPICS:        int   = 3    # single-lecture PDFs may have fewer sections
 SANITY_MAX_TOPICS:        int   = 50
-SANITY_MIN_COVERAGE:      float = 0.40   # fraction of chunks covered across all topics
+SANITY_MIN_COVERAGE:      float = 0.20   # fraction of chunks covered across all topics
 LOW_CONFIDENCE_THRESHOLD: float = 0.45   # overall_confidence below this → is_low_confidence
 
 

@@ -286,7 +286,12 @@ def generate_from_blueprint(
 
     def _build_slot_query(topic_name: str, q_type_value: str) -> str:
         suffix = _SLOT_QUERY_SUFFIXES.get(q_type_value, "")
-        return f"{topic_name} {suffix}".strip()
+        # When the topic name is the synthetic fallback "General" it adds no
+        # semantic information — prepending it skews the embedding toward generic
+        # boilerplate text and starves the retrieval of real instructional chunks.
+        # Use only the type-specific suffix for the vector search in that case.
+        effective_topic = "" if topic_name.strip().lower() == "general" else topic_name
+        return f"{effective_topic} {suffix}".strip() or topic_name
 
     # Maximum LLM attempts per individual question before marking it failed.
     MAX_SLOT_ATTEMPTS = 3

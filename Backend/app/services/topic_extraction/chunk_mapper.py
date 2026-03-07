@@ -13,6 +13,7 @@ Returns a list of dicts ready for bulk-insert into `topic_chunk_map`.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 _SIM_TOP_K = 8           # max chunks per topic via embedding similarity
 _SIM_THRESHOLD = 0.30    # minimum cosine similarity to include a mapping
 _PAGE_MIN_CHUNKS = 2     # if page-range gives fewer chunks, augment with emb
+_TF_TOP_K = 5            # max chunks per topic via text-frequency fallback
+_TF_MIN_SCORE = 0.01     # minimum TF score to include (> 0 means at least 1 occurrence)
 
 
 def _cosine_batch(query: "np.ndarray", matrix: "np.ndarray") -> "np.ndarray":
@@ -146,6 +149,42 @@ class TopicChunkMapper:
                                 added += 1
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("TopicChunkMapper: embedding sim error for topic %s: %s", tid, exc)
+
+            # --- Path 3: text-frequency fallback ----------------------------
+            # When neither page-range nor embedding similarity mapped any chunks,
+            # fall back to counting keyword occurrences in chunk text.  This
+            # ensures slide-deck PDFs with bad page metadata or out-of-vocab
+            # titles still get *some* chunk associations.
+            if tid not in seen or not seen[tid]:
+                topic_title = getattr(topic, "title", None) or getattr(topic, "name", "")
+                if topic_title:
+                    needle = topic_title.lower()
+                    # Also split into significant keywords (≥3 chars) for partial matching
+                    keywords = [w for w in re.findall(r"[a-zA-Z]{3,}", needle)]
+                    tf_scores: list[tuple[float, Any]] = []
+                    for ch in chunk_list:
+                        if ch.id in seen[tid]:
+                            continue
+                        text = (getattr(ch, "content", None) or "").lower()
+                        if not text:
+                            continue
+                        token_count = max(1, len(re.findall(r"[a-zA-Z]{3,}", text)))
+                        # Full-phrase count (weighted higher)
+                        phrase_hits = text.count(needle)
+                        # Individual keyword counts
+                        kw_hits = sum(text.count(kw) for kw in keywords) if keywords else 0
+                        score = (phrase_hits * 2 + kw_hits) / token_count
+                        if score >= _TF_MIN_SCORE:
+                            tf_scores.append((score, ch))
+                    tf_scores.sort(key=lambda x: x[0], reverse=True)
+                    for score, ch in tf_scores[:_TF_TOP_K]:
+                        if ch.id not in seen[tid]:
+                            seen[tid].add(ch.id)
+                            rows.append({
+                                "topic_id": tid,
+                                "chunk_id": ch.id,
+                                "relevance_score": round(min(score, 0.75), 4),
+                            })
 
         logger.info(
             "TopicChunkMapper: %d topic-chunk mappings for %d topics",

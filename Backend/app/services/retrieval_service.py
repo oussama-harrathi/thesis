@@ -38,7 +38,10 @@ logger = logging.getLogger(__name__)
 
 # Minimum number of retrieved chunks required before we call the LLM.
 # Below this we attempt a broader (course-wide) fallback search first.
-MIN_CONTEXT_CHUNKS = 3
+# Set to 1: even a single chunk of context is enough for the LLM to
+# produce a grounded question.  Courses with only one short PDF may
+# legitimately have very few usable chunks.
+MIN_CONTEXT_CHUNKS = 1
 
 
 @dataclass
@@ -232,7 +235,7 @@ class RetrievalService:
         topic_id: uuid.UUID | None = None,
         course_id: uuid.UUID | None = None,
         top_k: int = 6,
-        min_score: float = 0.1,
+        min_score: float = 0.0,
         exclude_noncontent: bool = True,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
@@ -329,7 +332,9 @@ class RetrievalService:
                 "broadening to course-wide retrieval (course=%s, query=%r)",
                 len(combined), course_id, (query or "")[:60],
             )
-            broad_top_k = fetch_k * 2
+            # Use 4× to ensure we reach well past whatever text-filtered chunks
+            # were already fetched in the first pass (they all sit in seen_ids).
+            broad_top_k = fetch_k * 4
             broad_chunks = await self.retrieve_by_query(
                 db,
                 query,
@@ -338,6 +343,7 @@ class RetrievalService:
                 min_score=0.05,
             )
             already_used = exclude_chunk_ids or set()
+            # First pass: prefer chunks NOT in already_used
             for c in broad_chunks:
                 boilerplate = exclude_noncontent and is_excluded_for_generation(c.content)
                 if (
@@ -348,8 +354,69 @@ class RetrievalService:
                 ):
                     seen_ids.add(c.chunk_id)
                     combined.append(c)
+            # Second pass: if still too few, allow reuse of exclude_chunk_ids
+            # (chunk reuse is better than total generation failure)
+            if len(combined) < MIN_CONTEXT_CHUNKS:
+                for c in broad_chunks:
+                    boilerplate = exclude_noncontent and is_excluded_for_generation(c.content)
+                    if (
+                        c.chunk_id not in seen_ids
+                        and not boilerplate
+                        and len(combined) < broad_top_k
+                    ):
+                        seen_ids.add(c.chunk_id)
+                        combined.append(c)
             logger.info(
                 "retrieve_for_generation: after broadening: %d chunk(s) for course=%s",
+                len(combined), course_id,
+            )
+
+        # 4b. Emergency last-resort: when both vector passes returned 0 usable
+        # chunks (e.g. the embedding doesn't point toward instructional content),
+        # pull ANY instructional chunks from the course ordered by chunk_index.
+        # We trust the DB chunk_type filter here and skip the aggressive text
+        # filter so generation can still proceed.
+        if len(combined) < MIN_CONTEXT_CHUNKS and course_id is not None:
+            logger.warning(
+                "retrieve_for_generation: vector search exhausted — "
+                "falling back to ordered content dump for course=%s",
+                course_id,
+            )
+            from app.models.document import Document as _Document
+            from sqlalchemy import asc as _asc
+
+            emergency_stmt = (
+                select(Chunk)
+                .join(_Document, _Document.id == Chunk.document_id)
+                .where(
+                    _Document.course_id == course_id,
+                    Chunk.chunk_type.notin_(_EXCLUDED_CHUNK_TYPES),  # type: ignore[attr-defined]
+                    Chunk.embedding.isnot(None),  # type: ignore[attr-defined]
+                )
+                .order_by(_asc(Chunk.chunk_index))
+                .limit(top_k * 6)
+            )
+            emergency_result = await db.execute(emergency_stmt)
+            emergency_rows = emergency_result.scalars().all()
+            for ch in emergency_rows:
+                # NOTE: intentionally checking NEITHER seen_ids NOR
+                # exclude_chunk_ids here — the emergency dump is a last-resort
+                # and chunk reuse across slots is acceptable when the
+                # alternative is total generation failure.
+                if ch.id not in {c.chunk_id for c in combined}:
+                    combined.append(
+                        RetrievedChunk(
+                            chunk_id=ch.id,
+                            document_id=ch.document_id,
+                            content=ch.content,
+                            chunk_index=ch.chunk_index,
+                            score=0.50,  # neutral score — not ranked by relevance
+                        )
+                    )
+                if len(combined) >= top_k * 2:
+                    break
+            logger.info(
+                "retrieve_for_generation: emergency dump yielded %d chunk(s) for course=%s",
                 len(combined), course_id,
             )
 

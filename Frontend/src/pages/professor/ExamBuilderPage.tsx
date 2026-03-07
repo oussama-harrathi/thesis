@@ -31,6 +31,17 @@ import type {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
+/** Try to extract 'detail' from a JSON error message, fallback to raw string */
+function parseApiError(err: Error | null): string {
+  if (!err) return 'Unknown error'
+  const msg = err.message
+  try {
+    const parsed = JSON.parse(msg)
+    if (parsed.detail) return String(parsed.detail)
+  } catch { /* not JSON */ }
+  return msg
+}
+
 const TYPE_LABEL: Record<string, string> = {
   mcq: 'MCQ',
   true_false: 'T/F',
@@ -223,7 +234,9 @@ function ExamSection({ blueprintId, blueprint, selectedExamId, onSelectExam }: E
               placeholder="Exam instructions or notes…"
             />
             {assembleMutation.isError && (
-              <p style={s.errorText}>Assembly failed: {assembleMutation.error?.message}</p>
+              <p style={s.errorText}>
+                {parseApiError(assembleMutation.error)}
+              </p>
             )}
             <div style={{ textAlign: 'right', marginTop: 6 }}>
               <button

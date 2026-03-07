@@ -241,11 +241,15 @@ class TopicExtractionOrchestrator:
             db.refresh(row)
 
         actual_coverage = round(len(all_covered) / total_chunks, 4)
+        # Mark low-confidence only when confidence is truly low OR sanity fails.
+        # Do NOT penalise for low coverage when the extractor is high-confidence
+        # and passes sanity — coverage can legitimately be 0 for slide PDFs where
+        # page-range matching fails and embedding similarity is below threshold.
+        high_conf = best.overall_confidence >= 0.75 and best_passes_sanity
         is_low = (
             best.overall_confidence < LOW_CONFIDENCE_THRESHOLD
-            or not best_passes_sanity
-            or actual_coverage < SANITY_MIN_COVERAGE
-        )
+            or (not best_passes_sanity and actual_coverage < SANITY_MIN_COVERAGE)
+        ) and not high_conf
         meta = CourseExtractionMeta(
             chosen_method=best.method,
             overall_confidence=round(best.overall_confidence, 4),

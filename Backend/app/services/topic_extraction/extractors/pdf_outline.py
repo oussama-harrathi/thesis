@@ -32,9 +32,9 @@ _LEVEL_MAP: dict[int, str] = {
     3: LEVEL_SUBSECTION,
 }
 
-# Strip leading "1.", "1.2", "Chapter 3", "Section 3.2" prefixes
+# Strip leading "1.", "1.2", "Chapter 3", "Section 3.2", "Slide 10:" prefixes
 _PREFIX_RE = re.compile(
-    r"^(?:(?:chapter|section|part|unit|lecture|module|appendix)\s*[\d.]*\s*[:\-–]?\s*"
+    r"^(?:(?:chapter|section|part|unit|lecture|module|appendix|slide)\s*[\d.]*\s*[:\-–]?\s*"
     r"|[\d]+(?:\.[\d]+)*\.?\s+)",
     re.IGNORECASE,
 )
@@ -88,7 +88,10 @@ class PdfOutlineTocExtractor:
                 continue
             level_int = max(1, min(int(item[0]), 3))
             raw_title = str(item[1] or "").strip()
-            page = int(item[2]) if len(item) > 2 and item[2] else None
+            # PyMuPDF page numbers are 1-based; 0 means "unknown destination"
+            # Use int(item[2]) directly (even if 0) then treat 0 as None below
+            raw_page = int(item[2]) if len(item) > 2 and item[2] is not None else None
+            page = raw_page if (raw_page is not None and raw_page > 0) else None
             raw_levels.append((raw_title, level_int, page))
 
         # Fill end_page: end = next entry's start_page - 1 (for same/higher level)

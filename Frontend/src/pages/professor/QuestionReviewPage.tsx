@@ -204,7 +204,7 @@ export default function QuestionReviewPage() {
         <h1 style={s.pageTitle}>Question Review</h1>
         <button
           style={s.btnExamBuilder}
-          onClick={() => navigate(`/professor/exam-builder`)}
+          onClick={() => navigate(`/courses/${courseId}/exam-builder`)}
           title="Go to Exam Builder"
         >
           Go to Exam Builder →
