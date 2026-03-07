@@ -3,7 +3,8 @@
  *
  * List:    useCourseQuestions(courseId, filters)
  * Detail:  useQuestion(questionId)
- * Mutate:  useUpdateQuestion, useApproveQuestion, useRejectQuestion
+ * Mutate:  useUpdateQuestion, useApproveQuestion, useRejectQuestion,
+ *          useReplacementCandidates, useReplaceInBlueprint
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -22,6 +23,14 @@ export const questionKeys = {
 
   /** Single question detail */
   detail: (questionId: string) => ['questions', questionId] as const,
+
+  /** Replacement candidates for a blueprint question */
+  replacementCandidates: (
+    courseId: string,
+    type: string,
+    excludeBlueprintId: string,
+  ) =>
+    ['questions', 'replacement-candidates', courseId, type, excludeBlueprintId] as const,
 }
 
 // ── Queries ───────────────────────────────────────────────────────
@@ -97,6 +106,57 @@ export function useRejectQuestion(courseId: string) {
     onSuccess: (_data, { questionId }) => {
       qc.invalidateQueries({ queryKey: questionKeys.byCourse(courseId) })
       qc.invalidateQueries({ queryKey: questionKeys.detail(questionId) })
+    },
+  })
+}
+
+/**
+ * GET /api/v1/courses/{courseId}/questions/replacement-candidates
+ * Fetch approved same-type questions not already in a blueprint.
+ */
+export function useReplacementCandidates(
+  courseId: string | undefined,
+  questionType: string | undefined,
+  excludeBlueprintId: string | undefined,
+) {
+  return useQuery({
+    queryKey: questionKeys.replacementCandidates(
+      courseId ?? '',
+      questionType ?? '',
+      excludeBlueprintId ?? '',
+    ),
+    queryFn: () =>
+      questionsApi.listReplacementCandidates(
+        courseId!,
+        questionType!,
+        excludeBlueprintId!,
+      ),
+    enabled: Boolean(courseId) && Boolean(questionType) && Boolean(excludeBlueprintId),
+    staleTime: 0, // Always fresh when the modal opens
+  })
+}
+
+/**
+ * POST /api/v1/blueprints/{blueprintId}/questions/{questionId}/replace
+ */
+export function useReplaceInBlueprint(courseId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      blueprintId,
+      questionId,
+      replacementQuestionId,
+    }: {
+      blueprintId: string
+      questionId: string
+      replacementQuestionId: string
+    }) =>
+      questionsApi.replaceInBlueprint(blueprintId, questionId, {
+        replacement_question_id: replacementQuestionId,
+      }),
+    onSuccess: () => {
+      // Invalidate all question lists for the course since blueprint mapping changed.
+      qc.invalidateQueries({ queryKey: questionKeys.byCourse(courseId) })
     },
   })
 }

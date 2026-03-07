@@ -59,6 +59,7 @@ class BloomLevel(str, enum.Enum):
 
 class QuestionStatus(str, enum.Enum):
     draft = "draft"
+    reviewed = "reviewed"   # rejected → edited by professor → awaits re-approval
     approved = "approved"
     rejected = "rejected"
 
@@ -84,6 +85,15 @@ class QuestionSet(Base):
         nullable=False,
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Optional link to the blueprint that generated this set (professor mode only).
+    # Populated by the generation task; NULL for student practice sets.
+    blueprint_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("exam_blueprints.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), nullable=False

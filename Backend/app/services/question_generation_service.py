@@ -65,7 +65,7 @@ from app.services.context_builder import ContextBuilder
 from app.services.diversity_service import DiversityContext, DiversityService
 from app.services.retrieval_service import MIN_CONTEXT_CHUNKS, RetrievalService, RetrievedChunk
 from app.services.validation_service import CorrectnessResult, ValidationService
-from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_duplicate_question, should_reject_trivial
+from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_duplicate_question, is_excluded_for_generation, should_reject_trivial
 from app.utils.text_normalization import normalize_mcs_notation
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,19 @@ class QuestionGenerationService:
             logger.warning(
                 "generate_mcq: SKIP — 0 chunks after fallback for course=%s topic=%r",
                 course_id, topic_name,
+            )
+            return []
+
+        # ── Defense-in-depth: text-based re-filter ─────────────────────────
+        # Catches boilerplate chunks that were persisted before the chunk_type
+        # column existed (server_default sets them all to 'instructional').
+        # For chunks persisted post-migration this is a fast no-op.
+        chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
+        if len(chunks) < MIN_CONTEXT_CHUNKS:
+            logger.warning(
+                "generate_mcq: SKIP after pre-LLM text safeguard — "
+                "%d chunk(s) remain (need %d) for course=%s topic=%r",
+                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
             )
             return []
 
@@ -349,6 +362,8 @@ class QuestionGenerationService:
                     target_difficulty=difficulty, target_bloom=bloom,
                     correctness_result=mcq_correctness,
                 )
+                if len(saved) >= count:
+                    break  # LLM over-produced; stop persisting beyond requested count
             except Exception as exc:
                 # One bad question should not abort the whole batch.
                 logger.error(
@@ -453,12 +468,14 @@ class QuestionGenerationService:
                     exc,
                 )
 
-        # 3. Difficulty tagging — heuristic only.
-        #    The generation LLM already embedded difficulty in the question JSON;
-        #    a second LLM re-classification wastes 2 Gemini calls per question.
+        # 3. Difficulty tagging — heuristic, for the validation audit row ONLY.
+        #    The question was generated for a specific blueprint-requested difficulty;
+        #    we must NOT overwrite that with an unreliable heuristic guess.
+        #    update_question=False keeps the generation-requested difficulty intact
+        #    while still recording the heuristic result in question_validations.
         try:
             await self._validation_svc.tag_difficulty(
-                db, question, provider=None
+                db, question, provider=None, update_question=False
             )
         except Exception as exc:
             logger.warning(
@@ -569,6 +586,16 @@ class QuestionGenerationService:
             logger.warning(
                 "generate_true_false: SKIP — 0 chunks after fallback for course=%s topic=%r",
                 course_id, topic_name,
+            )
+            return []
+
+        # ── Defense-in-depth: text-based re-filter ─────────────────────────
+        chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
+        if len(chunks) < MIN_CONTEXT_CHUNKS:
+            logger.warning(
+                "generate_true_false: SKIP after pre-LLM text safeguard — "
+                "%d chunk(s) remain (need %d) for course=%s topic=%r",
+                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
             )
             return []
 
@@ -732,6 +759,8 @@ class QuestionGenerationService:
                     target_difficulty=difficulty, target_bloom=bloom,
                     correctness_result=tf_correctness,
                 )
+                if len(saved) >= count:
+                    break  # LLM over-produced; stop persisting beyond requested count
             except Exception as exc:
                 logger.error(
                     "generate_true_false: failed to persist question (statement=%r): %s",
@@ -810,6 +839,16 @@ class QuestionGenerationService:
                 "generate_short_answer: SKIP — 0 chunks after fallback for "
                 "course=%s topic=%r",
                 course_id, topic_name,
+            )
+            return []
+
+        # ── Defense-in-depth: text-based re-filter ─────────────────────────
+        chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
+        if len(chunks) < MIN_CONTEXT_CHUNKS:
+            logger.warning(
+                "generate_short_answer: SKIP after pre-LLM text safeguard — "
+                "%d chunk(s) remain (need %d) for course=%s topic=%r",
+                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
             )
             return []
 
@@ -951,6 +990,8 @@ class QuestionGenerationService:
                     used_question_stems.append(q_output.question)
                 await self._run_validators(db, question, is_mcq=False,
                                            target_difficulty=difficulty, target_bloom=bloom)
+                if len(saved) >= count:
+                    break  # LLM over-produced; stop persisting beyond requested count
             except Exception as exc:
                 logger.error(
                     "generate_short_answer: failed to persist question=%r: %s",
@@ -1030,6 +1071,16 @@ class QuestionGenerationService:
                 "generate_essay: SKIP — 0 chunks after fallback for "
                 "course=%s topic=%r",
                 course_id, topic_name,
+            )
+            return []
+
+        # ── Defense-in-depth: text-based re-filter ─────────────────────────
+        chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
+        if len(chunks) < MIN_CONTEXT_CHUNKS:
+            logger.warning(
+                "generate_essay: SKIP after pre-LLM text safeguard — "
+                "%d chunk(s) remain (need %d) for course=%s topic=%r",
+                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
             )
             return []
 
@@ -1166,6 +1217,8 @@ class QuestionGenerationService:
                     used_question_stems.append(q_output.question)
                 await self._run_validators(db, question, is_mcq=False,
                                            target_difficulty=difficulty, target_bloom=bloom)
+                if len(saved) >= count:
+                    break  # LLM over-produced; stop persisting beyond requested count
             except Exception as exc:
                 logger.error(
                     "generate_essay: failed to persist question=%r: %s",

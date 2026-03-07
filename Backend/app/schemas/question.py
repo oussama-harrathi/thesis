@@ -207,6 +207,14 @@ class QuestionListResponse(BaseModel):
     status: QuestionStatus
     created_at: datetime
 
+    # Blueprint context (populated from question_sets.blueprint_id join)
+    blueprint_id: uuid.UUID | None = None
+    blueprint_title: str | None = None
+
+    # Blueprint context — populated when the question belongs to a blueprint's set.
+    blueprint_id: uuid.UUID | None = None
+    blueprint_title: str | None = None
+
 
 class GenerationResponse(BaseModel):
     """Envelope returned by generation endpoints."""
@@ -230,3 +238,29 @@ class QuestionStatusResponse(BaseModel):
 
     id: uuid.UUID
     status: QuestionStatus
+
+
+# ── Replacement schemas ───────────────────────────────────────────────────────
+
+
+class ReplacementCandidateResponse(BaseModel):
+    """A candidate question that can replace another in a blueprint."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    type: QuestionType
+    body: str
+    difficulty: Difficulty
+    bloom_level: BloomLevel | None
+    status: QuestionStatus
+    blueprint_id: uuid.UUID | None = None
+    blueprint_title: str | None = None
+
+
+class ReplaceQuestionRequest(BaseModel):
+    """Body for POST /blueprints/{blueprint_id}/questions/{question_id}/replace."""
+
+    replacement_question_id: uuid.UUID = Field(
+        description="ID of the approved question to use as the replacement."
+    )

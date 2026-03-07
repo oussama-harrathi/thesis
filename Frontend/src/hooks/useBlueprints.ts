@@ -34,3 +34,15 @@ export function useGenerateFromBlueprint() {
     mutationFn: (blueprintId: string) => blueprintsApi.generate(blueprintId),
   })
 }
+
+export function useDeleteBlueprint(courseId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (blueprintId: string) => blueprintsApi.delete(blueprintId),
+    onSuccess: () => {
+      // Refresh blueprints list and all question data for this course.
+      qc.invalidateQueries({ queryKey: ['blueprints', 'course', courseId] })
+      qc.invalidateQueries({ queryKey: ['questions', 'course', courseId] })
+    },
+  })
+}

@@ -35,13 +35,14 @@ from app.llm.base import (
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
-_MAX_RATE_LIMIT_RETRIES = 4       # how many times to retry on 429
+_MAX_RATE_LIMIT_RETRIES = 3       # how many times to retry on 429 before giving up
 _DEFAULT_RATE_LIMIT_WAIT = 15.0   # seconds to wait if no retryDelay in error
+_MAX_RETRY_WAIT = 20.0            # hard cap: never wait more than this per retry
 
 # ── Module-level throttle (shared across all GeminiProvider instances) ────────
 # Enforces minimum spacing between API calls so we never burst past the
-# free-tier limit (5 req/min = one call every 12s).
-_GEMINI_MIN_INTERVAL: float = 12.5   # seconds between calls
+# free-tier limit (10 req/min for flash-lite = one call every ~6s).
+_GEMINI_MIN_INTERVAL: float = 6.5    # seconds between calls
 _gemini_throttle_lock: asyncio.Lock | None = None
 _gemini_last_call_at: float = 0.0
 
@@ -159,7 +160,7 @@ class GeminiProvider(BaseLLMProvider):
                 break
             except Exception as exc:
                 if _is_rate_limit(exc):
-                    wait = _extract_retry_delay(exc)
+                    wait = min(_extract_retry_delay(exc), _MAX_RETRY_WAIT)
                     logger.warning(
                         "[gemini] 429 rate-limited (attempt %d/%d) — sleeping %.1fs",
                         attempt, _MAX_RATE_LIMIT_RETRIES, wait,
@@ -169,7 +170,10 @@ class GeminiProvider(BaseLLMProvider):
                         last_exc = exc
                         continue
                     else:
-                        raise LLMProviderError(f"[gemini] API call failed: {exc}") from exc
+                        raise LLMProviderError(
+                            f"[gemini] Rate limit exhausted after {_MAX_RATE_LIMIT_RETRIES} "
+                            f"attempt(s) — giving up: {exc}"
+                        ) from exc
                 raise LLMProviderError(f"[gemini] API call failed: {exc}") from exc
 
         if last_exc is not None:
@@ -200,7 +204,7 @@ class GeminiProvider(BaseLLMProvider):
                     break
                 except Exception as exc2:
                     if _is_rate_limit(exc2):
-                        wait2 = _extract_retry_delay(exc2)
+                        wait2 = min(_extract_retry_delay(exc2), _MAX_RETRY_WAIT)
                         logger.warning(
                             "[gemini] 429 on parse-retry (attempt %d/%d) — sleeping %.1fs",
                             attempt2, _MAX_RATE_LIMIT_RETRIES, wait2,

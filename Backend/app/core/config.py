@@ -60,7 +60,7 @@ class Settings(BaseSettings):
 
     # ── Gemini provider ──────────────────────────────────────────────
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
     GEMINI_TEMPERATURE: float = 0.3
     GEMINI_MAX_TOKENS: int = 2048
     GEMINI_TIMEOUT: float = 60.0

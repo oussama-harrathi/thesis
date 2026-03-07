@@ -104,7 +104,7 @@ export type BloomLevel =
   | 'analyze'
   | 'evaluate'
   | 'create'
-export type QuestionStatus = 'draft' | 'approved' | 'rejected'
+export type QuestionStatus = 'draft' | 'reviewed' | 'approved' | 'rejected'
 
 /** Lightweight row returned by GET /courses/{id}/questions */
 export interface QuestionListItem {
@@ -116,6 +116,8 @@ export interface QuestionListItem {
   bloom_level: BloomLevel | null
   status: QuestionStatus
   created_at: string
+  blueprint_id: string | null
+  blueprint_title: string | null
 }
 
 /** One MCQ option from GET /questions/{id} */
@@ -178,6 +180,23 @@ export interface RejectRequest {
 export interface QuestionStatusResponse {
   id: string
   status: QuestionStatus
+}
+
+// ── Question replacement ───────────────────────────────────────────
+
+export interface ReplacementCandidateResponse {
+  id: string
+  type: QuestionType
+  body: string
+  difficulty: Difficulty
+  bloom_level: BloomLevel | null
+  status: QuestionStatus
+  blueprint_id: string | null
+  blueprint_title: string | null
+}
+
+export interface ReplaceQuestionRequest {
+  replacement_question_id: string
 }
 
 // ── Exams ─────────────────────────────────────────────────────────

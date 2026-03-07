@@ -1,11 +1,12 @@
 """
 Blueprint API routes (Phase 9).
 
-POST   /api/v1/courses/{course_id}/blueprints      → create blueprint
-GET    /api/v1/courses/{course_id}/blueprints      → list blueprints for course
-GET    /api/v1/blueprints/{blueprint_id}           → get single blueprint
-PATCH  /api/v1/blueprints/{blueprint_id}           → partial update blueprint
-POST   /api/v1/blueprints/{blueprint_id}/generate  → start generation job
+POST   /api/v1/courses/{course_id}/blueprints                              → create blueprint
+GET    /api/v1/courses/{course_id}/blueprints                              → list blueprints for course
+GET    /api/v1/blueprints/{blueprint_id}                                   → get single blueprint
+PATCH  /api/v1/blueprints/{blueprint_id}                                   → partial update blueprint
+POST   /api/v1/blueprints/{blueprint_id}/generate                          → start generation job
+POST   /api/v1/blueprints/{blueprint_id}/questions/{question_id}/replace   → replace a question in the blueprint
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ from app.schemas.blueprint import (
     BlueprintUpdateRequest,
 )
 from app.schemas.job import StartGenerationResponse
+from app.schemas.question import ReplaceQuestionRequest
 from app.services.blueprint_service import BlueprintService
+from app.services.question_service import QuestionService
 
 # Two routers so we can mount them under different prefixes in main.py
 courses_router = APIRouter(tags=["blueprints"])  # prefix: /courses/{course_id}/blueprints
@@ -192,3 +195,70 @@ async def start_generation(
         blueprint_id=blueprint.id,
         status=JobStatus.pending,
     )
+
+
+@blueprints_router.delete(
+    "/blueprints/{blueprint_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a blueprint and all its questions",
+)
+async def delete_blueprint(
+    blueprint_id: uuid.UUID,
+    db: DbSession,
+) -> None:
+    """
+    Permanently delete *blueprint_id* together with every QuestionSet and
+    Question that was generated for it.
+
+    Raises **404** if the blueprint does not exist.
+    """
+    blueprint = await _svc.get_by_id(db, blueprint_id)
+    if blueprint is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Blueprint {blueprint_id} not found.",
+        )
+
+    await _svc.delete_with_questions(db, blueprint)
+    await db.commit()
+
+
+@blueprints_router.post(
+    "/blueprints/{blueprint_id}/questions/{question_id}/replace",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Replace a question in a blueprint with an approved question from another blueprint",
+)
+async def replace_blueprint_question(
+    blueprint_id: uuid.UUID,
+    question_id: uuid.UUID,
+    payload: ReplaceQuestionRequest,
+    db: DbSession,
+) -> None:
+    """
+    Atomically swap *question_id* out of *blueprint_id* and put
+    *replacement_question_id* in its place.
+
+    Rules enforced:
+    - The replacement must be **approved**.
+    - The replacement must have the **same question type** as the original.
+    - The replacement must **not already be in** the target blueprint.
+    - The original question must **exist in** the target blueprint's mapping.
+
+    Raises **404** if the blueprint or original question mapping is not found.
+    Raises **422** if validation rules are violated.
+    Raises **409** if the replacement is already in the blueprint.
+    """
+    blueprint = await _svc.get_by_id(db, blueprint_id)
+    if blueprint is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Blueprint {blueprint_id} not found.",
+        )
+
+    q_svc = QuestionService(db)
+    await q_svc.replace_in_blueprint(
+        blueprint_id=blueprint_id,
+        old_question_id=question_id,
+        new_question_id=payload.replacement_question_id,
+    )
+    await db.commit()

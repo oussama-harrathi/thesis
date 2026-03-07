@@ -22,6 +22,8 @@ import type {
   QuestionUpdateRequest,
   RejectRequest,
   QuestionStatusResponse,
+  ReplacementCandidateResponse,
+  ReplaceQuestionRequest,
   Exam,
   ExamListItem,
   AssembleExamRequest,
@@ -222,6 +224,44 @@ export const questionsApi = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  /**
+   * GET /api/v1/courses/{courseId}/questions/replacement-candidates
+   * Returns approved same-type questions not yet in the target blueprint.
+   */
+  listReplacementCandidates: (
+    courseId: string,
+    type: string,
+    excludeBlueprintId: string,
+  ) => {
+    const qs = new URLSearchParams({ type, exclude_blueprint_id: excludeBlueprintId })
+    return apiRequest<ReplacementCandidateResponse[]>(
+      `/courses/${courseId}/questions/replacement-candidates?${qs.toString()}`,
+    )
+  },
+
+  /**
+   * POST /api/v1/blueprints/{blueprintId}/questions/{questionId}/replace
+   * Swaps a question in a blueprint for an approved replacement.
+   */
+  replaceInBlueprint: (
+    blueprintId: string,
+    questionId: string,
+    body: ReplaceQuestionRequest,
+  ) =>
+    fetch(
+      `${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/blueprints/${blueprintId}/questions/${questionId}/replace`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    ).then(async (res) => {
+      if (!res.ok && res.status !== 204) {
+        const text = await res.text().catch(() => res.statusText)
+        throw new ApiError(res.status, text)
+      }
+    }),
 }
 
 // ── Blueprints ────────────────────────────────────────────────────
@@ -247,6 +287,10 @@ export const blueprintsApi = {
     apiRequest<StartGenerationResponse>(`/blueprints/${blueprintId}/generate`, {
       method: 'POST',
     }),
+
+  /** DELETE /api/v1/blueprints/{blueprintId} */
+  delete: (blueprintId: string) =>
+    apiRequest<void>(`/blueprints/${blueprintId}`, { method: 'DELETE' }),
 }
 
 // ── Jobs ─────────────────────────────────────────────────────────

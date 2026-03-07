@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.models.chunk import Chunk
 from app.services.chunking_service import TextChunk
+from app.utils.chunk_classifier import classify_chunk_type
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,19 @@ class ChunkPersistenceService:
         for idx, chunk in enumerate(chunks):
             embedding = vectors[idx] if has_vectors else None
 
+            # Classify chunk content type deterministically (no LLM call).
+            # This powers the hard DB-level filter in RetrievalService so that
+            # admin/boilerplate chunks are never returned to question generators.
+            ct_type, ct_score, ct_rules = classify_chunk_type(chunk.content)
+            if ct_type.value != "instructional":
+                logger.debug(
+                    "Chunk %d classified as %s (score=%d, rules=%s)",
+                    chunk.chunk_index,
+                    ct_type.value,
+                    ct_score,
+                    ct_rules[:5],
+                )
+
             row = Chunk(
                 document_id=document_id,
                 content=chunk.content,
@@ -90,6 +104,8 @@ class ChunkPersistenceService:
                 page_start=getattr(chunk, "page_start", None),
                 page_end=getattr(chunk, "page_end", None),
                 embedding=embedding,
+                chunk_type=ct_type,
+                chunk_type_score=ct_score,
             )
             self._db.add(row)
             # flush every 50 rows to avoid very large pending state

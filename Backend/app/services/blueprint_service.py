@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.exam import ExamBlueprint
-from app.models.question import Difficulty, QuestionType
+from app.models.question import Difficulty, QuestionSet, QuestionType
 from app.schemas.blueprint import (
     BlueprintConfig,
     BlueprintCreateRequest,
@@ -254,6 +254,46 @@ class BlueprintService:
         return blueprint
 
     # ------------------------------------------------------------------ #
+    # Delete                                                               #
+    # ------------------------------------------------------------------ #
+
+    async def delete_with_questions(
+        self,
+        db: AsyncSession,
+        blueprint: ExamBlueprint,
+    ) -> None:
+        """
+        Delete *blueprint* and all questions that were generated for it.
+
+        Cascade chain:
+        1. Locate every QuestionSet whose blueprint_id matches.
+        2. Delete each QuestionSet — DB CASCADE removes all child Questions,
+           MCQOptions, QuestionSources, and QuestionValidations automatically.
+        3. Delete the blueprint — DB CASCADE removes BlueprintQuestion mapping
+           rows automatically.
+
+        The caller is responsible for committing after this method returns.
+        """
+        stmt = select(QuestionSet).where(QuestionSet.blueprint_id == blueprint.id)
+        result = await db.execute(stmt)
+        question_sets = result.scalars().all()
+
+        for qs in question_sets:
+            await db.delete(qs)
+
+        await db.flush()  # ensure question_set deletes propagate before blueprint delete
+
+        await db.delete(blueprint)
+        await db.flush()
+
+        logger.info(
+            "BlueprintService.delete_with_questions: deleted blueprint=%s "
+            "question_sets=%d",
+            blueprint.id,
+            len(question_sets),
+        )
+
+    # ------------------------------------------------------------------ #
     # Slot expansion (pure — no I/O)                                       #
     # ------------------------------------------------------------------ #
 
@@ -376,6 +416,7 @@ class BlueprintService:
             course_id=blueprint.course_id,
             mode=QuestionSetMode.professor,
             title=f"Generated from: {blueprint.title}",
+            blueprint_id=blueprint.id,
         )
         db.add(question_set)
         await db.flush()

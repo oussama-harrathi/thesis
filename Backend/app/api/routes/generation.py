@@ -1,9 +1,10 @@
 """
 Generation API routes (Phase 7).
 
-POST /api/v1/courses/{course_id}/generate/mcq          → generate MCQ questions
-POST /api/v1/courses/{course_id}/generate/true-false   → generate True/False questions
-GET  /api/v1/courses/{course_id}/questions             → list questions for a course
+POST /api/v1/courses/{course_id}/generate/mcq                                   → generate MCQ questions
+POST /api/v1/courses/{course_id}/generate/true-false                            → generate True/False questions
+GET  /api/v1/courses/{course_id}/questions                                      → list questions for a course
+GET  /api/v1/courses/{course_id}/questions/replacement-candidates               → approved same-type questions from other blueprints
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from app.schemas.question import (
     GenerationResponse,
     QuestionListResponse,
     QuestionResponse,
+    ReplacementCandidateResponse,
 )
 from app.services.question_generation_service import QuestionGenerationService
 from app.services.question_service import QuestionService
@@ -185,6 +187,29 @@ async def generate_true_false(
 
 
 @router.get(
+    "/courses/{course_id}/questions/replacement-candidates",
+    response_model=list[ReplacementCandidateResponse],
+    summary="List approved replacement candidates for a blueprint question",
+    description=(
+        "Return approved questions of the requested type in this course that are "
+        "not already mapped to the specified blueprint."
+    ),
+)
+async def list_replacement_candidates(
+    course_id: uuid.UUID,
+    db: DbSession,
+    question_type: QuestionType = Query(alias="type"),
+    exclude_blueprint_id: uuid.UUID = Query(),
+) -> list[ReplacementCandidateResponse]:
+    svc = QuestionService(db)
+    return await svc.list_replacement_candidates(
+        course_id,
+        question_type=question_type,
+        exclude_blueprint_id=exclude_blueprint_id,
+    )
+
+
+@router.get(
     "/courses/{course_id}/questions",
     response_model=list[QuestionListResponse],
     summary="List questions for a course",
@@ -208,4 +233,4 @@ async def list_questions(
         limit=limit,
         offset=offset,
     )
-    return [QuestionListResponse.model_validate(q) for q in questions]
+    return questions

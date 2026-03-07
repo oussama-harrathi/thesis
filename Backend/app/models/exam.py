@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from app.models.course import Course
     from app.models.question import Question
 
-
 class ExamBlueprint(Base):
     """
     Professor-authored blueprint that describes the shape of an exam.
@@ -171,3 +170,55 @@ class ExamQuestion(Base):
 
     def __repr__(self) -> str:
         return f"<ExamQuestion id={self.id} exam_id={self.exam_id} pos={self.position}>"
+
+
+class BlueprintQuestion(Base):
+    """
+    Many-to-many mapping between blueprints and questions.
+
+    Created when a generation task saves a question to a blueprint's set.
+    Used for replacement tracking and blueprint-scoped views.
+    Deleting either side cascades here (question deleted → mapping gone,
+    blueprint deleted → mapping gone).
+    """
+
+    __tablename__ = "blueprint_questions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    blueprint_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("exam_blueprints.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("questions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Tracks the original blueprint if this question was imported via replacement.
+    original_blueprint_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("exam_blueprints.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), nullable=False
+    )
+
+    # ── Relationships ─────────────────────────────────────────────
+    blueprint: Mapped["ExamBlueprint"] = relationship(
+        "ExamBlueprint",
+        foreign_keys=[blueprint_id],
+        lazy="select",
+    )
+    question: Mapped["Question"] = relationship(
+        "Question",
+        lazy="select",
+    )
+
+    def __repr__(self) -> str:
+        return f"<BlueprintQuestion blueprint={self.blueprint_id} question={self.question_id}>"

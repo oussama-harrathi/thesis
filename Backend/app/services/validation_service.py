@@ -1573,13 +1573,32 @@ class ValidationService:
         #   AMBIGUOUS                         → keep (WARN)
         #   CORRECT / ERROR                   → keep
         should_reject = False
+        # Normalise both keys for comparison before making any reject decision.
+        # Some LLMs echo back the pre-filled correct_key value from the prompt even when
+        # they set verdict=WRONG_CORRECT, producing a self-contradictory response.
+        # If the verifier key agrees with the claimed key we cannot trust the verdict
+        # and must treat the result as AMBIGUOUS (fail-open) rather than rejecting.
+        _claimed_norm = (claimed_correct or "").upper().strip()
+        _verifier_key = (output.correct_key or "").upper().strip()
+        if _verifier_key not in {"A", "B", "C", "D"}:
+            _verifier_key = _claimed_norm  # invalid key → treat as agreement
+
+        _actual_disagreement = _verifier_key != _claimed_norm
+
         if verdict == CorrectnessVerdict.WRONG_CORRECT and output.confidence >= 0.80:
-            should_reject = True
-            logger.warning(
-                "verify_mcq_correctness: REJECT — wrong correct option "
-                "(verifier says %r, was %r, confidence=%.2f) stem=%r",
-                output.correct_key, claimed_correct, output.confidence, stem[:60],
-            )
+            if _actual_disagreement:
+                should_reject = True
+                logger.warning(
+                    "verify_mcq_correctness: REJECT — wrong correct option "
+                    "(verifier says %r, was %r, confidence=%.2f) stem=%r",
+                    _verifier_key, claimed_correct, output.confidence, stem[:60],
+                )
+            else:
+                logger.warning(
+                    "verify_mcq_correctness: self-contradictory verifier response "
+                    "(WRONG_CORRECT but correct_key=%r matches claimed=%r) — treating as AMBIGUOUS stem=%r",
+                    _verifier_key, _claimed_norm, stem[:60],
+                )
         elif verdict == CorrectnessVerdict.MULTIPLE_CORRECT:
             should_reject = True
             logger.warning(

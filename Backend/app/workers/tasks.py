@@ -406,7 +406,10 @@ def generate_from_blueprint(
             )
 
             slot_retrieval_query = _build_slot_query(topic_name, q_type.value)
-            chunk_ids_this_slot: list[uuid.UUID] = []
+
+            # Chunks retrieved in failed attempts within this slot — excluded on
+            # subsequent retries so the LLM always gets a fresh context window.
+            retry_exclude_chunk_ids: set[uuid.UUID] = set()
 
             # Derive Bloom target for this slot.
             base_bloom = DEFAULT_BLOOM_FOR_DIFFICULTY.get(diff_str, "apply")
@@ -430,9 +433,21 @@ def generate_from_blueprint(
             last_failure = "unknown"
 
             for attempt in range(1, MAX_SLOT_ATTEMPTS + 1):
+                # Reset per-attempt chunk accumulator so each retry starts clean.
+                chunk_ids_this_slot: list[uuid.UUID] = []
+
+                # Vary the seed per-attempt so retrieval tie-breaking shuffles
+                # differently and doesn't keep surfacing the same top chunks.
+                attempt_seed = generation_seed ^ (attempt * 0x9E3779B9)
+
+                # Combine job-level used chunks with this slot's retry-poisoned chunks.
+                effective_exclude = used_chunk_ids | retry_exclude_chunk_ids
+
                 logger.info(
-                    "generate_from_blueprint: %s — attempt %d/%d",
+                    "generate_from_blueprint: %s — attempt %d/%d "
+                    "(retry_excluded=%d)",
                     item_label, attempt, MAX_SLOT_ATTEMPTS,
+                    len(retry_exclude_chunk_ids),
                 )
 
                 async with async_session_factory() as db:
@@ -447,12 +462,12 @@ def generate_from_blueprint(
                                 difficulty=diff_str,
                                 count=1,
                                 retrieval_query=slot_retrieval_query,
-                                exclude_chunk_ids=used_chunk_ids,
+                                exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
-                                generation_seed=generation_seed,
+                                generation_seed=attempt_seed,
                                 penalize_chunk_ids=penalize_chunk_ids,
                             )
                         elif q_type == QuestionType.true_false:
@@ -465,12 +480,12 @@ def generate_from_blueprint(
                                 difficulty=diff_str,
                                 count=1,
                                 retrieval_query=slot_retrieval_query,
-                                exclude_chunk_ids=used_chunk_ids,
+                                exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
-                                generation_seed=generation_seed,
+                                generation_seed=attempt_seed,
                                 penalize_chunk_ids=penalize_chunk_ids,
                             )
                         elif q_type == QuestionType.short_answer:
@@ -483,12 +498,12 @@ def generate_from_blueprint(
                                 difficulty=diff_str,
                                 count=1,
                                 retrieval_query=slot_retrieval_query,
-                                exclude_chunk_ids=used_chunk_ids,
+                                exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
-                                generation_seed=generation_seed,
+                                generation_seed=attempt_seed,
                                 penalize_chunk_ids=penalize_chunk_ids,
                             )
                         elif q_type == QuestionType.essay:
@@ -501,12 +516,12 @@ def generate_from_blueprint(
                                 difficulty=diff_str,
                                 count=1,
                                 retrieval_query=slot_retrieval_query,
-                                exclude_chunk_ids=used_chunk_ids,
+                                exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
-                                generation_seed=generation_seed,
+                                generation_seed=attempt_seed,
                                 penalize_chunk_ids=penalize_chunk_ids,
                             )
                         else:
@@ -519,10 +534,31 @@ def generate_from_blueprint(
                             break
 
                         if generated:
+                            # Each blueprint slot is exactly 1 question.
+                            # The LLM may occasionally return more (over-generation);
+                            # cap to 1 so requested==generated counts stay consistent.
+                            generated = generated[:1]
                             total_generated += len(generated)
                             generated_this = True
                             # Register chunks as used so subsequent slots pull different material.
                             used_chunk_ids.update(chunk_ids_this_slot)
+
+                            # Insert blueprint_questions mapping rows for each generated question.
+                            try:
+                                from app.models.exam import BlueprintQuestion as _BPQ
+                                for _q in generated:
+                                    _bpq = _BPQ(
+                                        blueprint_id=bp_uuid,
+                                        question_id=_q.id,
+                                    )
+                                    db.add(_bpq)
+                                    await db.flush()
+                            except Exception as _bpq_exc:
+                                logger.warning(
+                                    "generate_from_blueprint: blueprint_questions insert failed for %s: %s",
+                                    item_label, _bpq_exc,
+                                )
+
                             await db.commit()
                             logger.info(
                                 "generate_from_blueprint: %s — OK on attempt %d "
@@ -539,6 +575,9 @@ def generate_from_blueprint(
                                 item_label, attempt,
                                 "retry" if attempt < MAX_SLOT_ATTEMPTS else "give up",
                             )
+                            # Poison the retrieved chunks for this failed attempt so
+                            # the next retry fetches a completely different context.
+                            retry_exclude_chunk_ids.update(chunk_ids_this_slot)
                             await db.rollback()
 
                     except Exception as exc:

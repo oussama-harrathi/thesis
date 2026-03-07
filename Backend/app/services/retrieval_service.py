@@ -23,7 +23,16 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.topic import Topic, TopicChunkMap
 from app.services.embedding_service import EmbeddingService
+from app.utils.chunk_classifier import ChunkType
 from app.utils.chunk_filter import is_excluded_for_generation
+
+# Chunk types that must NEVER be returned by retrieval for question generation.
+# Hard-coded — no runtime toggle.  Matching rows are filtered at DB level, not
+# in Python, to avoid loading their text into memory at all.
+_EXCLUDED_CHUNK_TYPES: tuple[ChunkType, ...] = (
+    ChunkType.admin_assessment,
+    ChunkType.references_boilerplate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +148,9 @@ class RetrievalService:
             stmt = stmt.join(Document, Document.id == Chunk.document_id).where(
                 Document.course_id == course_id
             )
+
+        # Hard DB-level filter: never surface admin/boilerplate chunks.
+        stmt = stmt.where(Chunk.chunk_type.notin_(_EXCLUDED_CHUNK_TYPES))  # type: ignore[attr-defined]
 
         stmt = stmt.order_by(TopicChunkMap.relevance_score.desc().nullslast()).limit(top_k)
 
@@ -439,6 +451,9 @@ class RetrievalService:
             stmt = stmt.join(Document, Document.id == Chunk.document_id).where(
                 Document.course_id == course_id
             )
+
+        # Hard DB-level filter: never surface admin/boilerplate chunks.
+        stmt = stmt.where(Chunk.chunk_type.notin_(_EXCLUDED_CHUNK_TYPES))  # type: ignore[attr-defined]
 
         stmt = stmt.order_by(cosine_distance).limit(top_k)
         return stmt
