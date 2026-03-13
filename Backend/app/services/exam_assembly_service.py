@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.exam import Exam, ExamBlueprint, ExamQuestion
+from app.models.exam import BlueprintQuestion, Exam, ExamBlueprint, ExamQuestion
 from app.models.question import Question, QuestionSet, QuestionStatus
 
 if TYPE_CHECKING:
@@ -82,7 +82,8 @@ class ExamAssemblyService:
         Assemble an exam from approved questions.
 
         If payload.question_set_id is provided, only questions from that set
-        are included.  Otherwise, all approved questions in the course are used.
+        are included.  Otherwise, only approved questions mapped to this
+        blueprint (via BlueprintQuestion) are used.
 
         Questions are ordered by: type, then difficulty (easy → medium → hard),
         then creation time.
@@ -102,11 +103,12 @@ class ExamAssemblyService:
                 .order_by(Question.type, Question.created_at)
             )
         else:
+            # Use BlueprintQuestion mapping to get only THIS blueprint's questions
             stmt = (
                 select(Question)
-                .join(QuestionSet)
+                .join(BlueprintQuestion, BlueprintQuestion.question_id == Question.id)
                 .where(
-                    QuestionSet.course_id == blueprint.course_id,
+                    BlueprintQuestion.blueprint_id == blueprint.id,
                     Question.status == QuestionStatus.approved,
                 )
                 .order_by(Question.type, Question.created_at)

@@ -64,7 +64,9 @@ class QuestionService:
         from app.models.exam import ExamBlueprint, BlueprintQuestion
         from app.schemas.question import QuestionListResponse
 
-        # Left-join Question → QuestionSet → optional ExamBlueprint
+        # Left-join Question → BlueprintQuestion → ExamBlueprint
+        # Uses the *current* blueprint mapping (BlueprintQuestion) rather than
+        # the static QuestionSet.blueprint_id so that replacements are reflected.
         stmt = (
             select(
                 Question,
@@ -72,7 +74,8 @@ class QuestionService:
                 ExamBlueprint.title.label("bp_title"),
             )
             .join(QuestionSet, QuestionSet.id == Question.question_set_id)
-            .outerjoin(ExamBlueprint, ExamBlueprint.id == QuestionSet.blueprint_id)
+            .outerjoin(BlueprintQuestion, BlueprintQuestion.question_id == Question.id)
+            .outerjoin(ExamBlueprint, ExamBlueprint.id == BlueprintQuestion.blueprint_id)
             .where(QuestionSet.course_id == course_id)
             .order_by(Question.created_at.desc())
         )
@@ -337,7 +340,8 @@ class QuestionService:
                 ExamBlueprint.title.label("bp_title"),
             )
             .join(QuestionSet, QuestionSet.id == Question.question_set_id)
-            .outerjoin(ExamBlueprint, ExamBlueprint.id == QuestionSet.blueprint_id)
+            .outerjoin(BlueprintQuestion, BlueprintQuestion.question_id == Question.id)
+            .outerjoin(ExamBlueprint, ExamBlueprint.id == BlueprintQuestion.blueprint_id)
             .where(QuestionSet.course_id == course_id)
             .where(Question.type == question_type)
             .where(Question.status == QuestionStatus.approved)

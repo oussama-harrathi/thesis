@@ -19,6 +19,17 @@ CRITICAL CONSTRAINTS — read before generating anything:
    repeat a definition ("X is defined as Y").  Prefer statements that assert an
    implication, property, or consequence that the student must reason about.
    If only trivial definition statements are possible, set insufficient_context to true.
+
+EXAM READABILITY RULES — the generated statement will appear on a printed exam:
+9. The statement must be SELF-CONTAINED.  A student reading the exam will NOT
+   have any "context block" or "provided text".
+   NEVER use phrases like:
+     "from the provided context", "according to the provided text",
+     "based on the context", "the given passage", "the context states",
+     "using the provided", "in the provided material".
+   Write the statement as a normal standalone exam statement.
+10. Do NOT create statements that reference graphs, figures, charts, diagrams,
+    curves, tables, or images that the student cannot see.
 """
 
 TF_GENERATION_USER = """\
@@ -28,6 +39,7 @@ Create {count} true/false question(s) based on the following course material con
 {context}
 --- END CONTEXT ---
 
+Course subject   : {course_subject}
 Difficulty level : {difficulty}
 Topic focus      : {topic}
 Target Bloom     : {target_bloom}

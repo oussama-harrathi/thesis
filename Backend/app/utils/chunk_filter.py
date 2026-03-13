@@ -219,3 +219,56 @@ def should_reject_trivial(text: str, difficulty: str, bloom: str) -> bool:
     if bloom.lower() == "remember":
         return False
     return is_trivial_question(text)
+
+
+# ── Context-leak / figure-reference detection ─────────────────────────────────
+
+# Phrases that betray "prompt leakage" — the LLM echoed its own instructions
+# into the visible question/stem text.
+_CONTEXT_LEAK_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bprovided\s+context\b", re.I),
+    re.compile(r"\bprovided\s+text\b", re.I),
+    re.compile(r"\bprovided\s+passage\b", re.I),
+    re.compile(r"\bprovided\s+material\b", re.I),
+    re.compile(r"\bgiven\s+context\b", re.I),
+    re.compile(r"\bgiven\s+passage\b", re.I),
+    re.compile(r"\bfrom\s+the\s+context\b", re.I),
+    re.compile(r"\bbased\s+on\s+the\s+context\b", re.I),
+    re.compile(r"\baccording\s+to\s+the\s+(?:provided|given)\b", re.I),
+    re.compile(r"\bthe\s+context\s+(?:states?|mentions?|describes?|shows?|indicates?)\b", re.I),
+    re.compile(r"\bin\s+the\s+provided\b", re.I),
+    re.compile(r"\busing\s+the\s+provided\b", re.I),
+    re.compile(r"\bthe\s+above\s+(?:context|text|passage)\b", re.I),
+]
+
+# Phrases referencing visual elements the student cannot see on a text-only exam.
+_FIGURE_REF_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bprovided\s+(?:relationship\s+)?curves?\b", re.I),
+    re.compile(r"\bprovided\s+(?:graph|figure|chart|diagram|table|image|plot)\b", re.I),
+    re.compile(r"\busing\s+the\s+(?:relationship\s+)?curves?\b", re.I),
+    re.compile(r"\brefer(?:ring)?\s+to\s+(?:the\s+)?(?:graph|figure|chart|diagram|table|plot)\b", re.I),
+    re.compile(r"\bas\s+shown\s+in\s+(?:the\s+)?(?:graph|figure|chart|diagram)\b", re.I),
+    re.compile(r"\bfrom\s+the\s+(?:graph|figure|chart|diagram|plot)\b", re.I),
+]
+
+
+def has_context_leak(text: str) -> bool:
+    """Return True if *text* contains phrases that leak the internal prompt framing."""
+    if not text:
+        return False
+    return any(p.search(text) for p in _CONTEXT_LEAK_PATTERNS)
+
+
+def has_figure_reference(text: str) -> bool:
+    """Return True if *text* references visual elements that students cannot see."""
+    if not text:
+        return False
+    return any(p.search(text) for p in _FIGURE_REF_PATTERNS)
+
+
+def should_reject_context_leak(text: str) -> bool:
+    """
+    Return True when a question should be rejected because it leaks
+    prompt framing or references visual elements unavailable on the exam.
+    """
+    return has_context_leak(text) or has_figure_reference(text)

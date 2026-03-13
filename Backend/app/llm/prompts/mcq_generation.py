@@ -22,6 +22,47 @@ CRITICAL CONSTRAINTS — read before generating anything:
    merely recall a term.  If the context only supports trivial recall, set
    insufficient_context to true.
 
+DISTRACTOR QUALITY RULES — critical for every MCQ:
+14. All four options MUST be about the SAME concept, topic, and domain.
+    NEVER grab random sentences, formulas, or notation from unrelated
+    parts of the context to use as filler distractors.
+15. Each distractor must represent a plausible misconception — something a
+    student with partial knowledge might genuinely confuse with the correct
+    answer.  Ask yourself: "Would a student who only half-understands this
+    topic pick this option?"  If no, replace it.
+16. NEVER create a distractor that simply restates, paraphrases, or
+    rewords the question stem.  The distractor must be a different
+    claim/answer, not the question itself repeated.
+17. If the correct answer involves a formula or notation, the distractors
+    must use similar-looking formulas or notation from the SAME concept —
+    not from an unrelated topic.
+    WRONG:  correct answer is about neural network weights → distractor
+            is a set-theory expression.
+    RIGHT:  correct answer is about neural network weights → distractors
+            are plausible but incorrect weight formulas or activation rules.
+18. All four options must be roughly the same type of content (all text,
+    all formulas, or all short phrases).  Do not mix a full sentence
+    distractor with a formula distractor unless the correct answer is
+    also a formula.
+
+EXAM READABILITY RULES — the generated question will appear on a printed exam:
+19. The question stem and options must be SELF-CONTAINED.  A student reading
+    the exam will NOT have any "context block" or "provided text".
+    NEVER use phrases like:
+      "from the provided context", "according to the provided text",
+      "based on the context", "the given passage", "the context states",
+      "using the provided", "in the provided material".
+    Instead, write the question as a normal standalone exam question.
+    WRONG:  "According to the provided context, what is…?"
+    RIGHT:  "What is…?"
+20. Do NOT create questions that require looking at graphs, figures, charts,
+    diagrams, curves, tables, or images.  The student will only have text on
+    the exam paper — no visual elements.  If the context describes a graph or
+    figure, either rephrase the question so it is answerable from the
+    textual description alone, or set insufficient_context to true.
+    WRONG:  "Using the provided relationship curves between TP and Temp…"
+    RIGHT:  "How does an increase in Total Phosphorus affect…?"
+
 SYMBOL AND FORMATTING RULES — apply to every stem, option, and explanation:
 9. Use ONLY Unicode math symbols — never ASCII approximations or all-caps keywords:
    ∀  (not "FORALL" or "8"),  ∃  (not "EXISTS" or "E" before a variable),
@@ -49,6 +90,7 @@ Create {count} multiple-choice question(s) based on the following course materia
 {context}
 --- END CONTEXT ---
 
+Course subject   : {course_subject}
 Difficulty level : {difficulty}
 Topic focus      : {topic}
 Target Bloom     : {target_bloom}

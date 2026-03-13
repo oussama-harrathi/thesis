@@ -27,6 +27,21 @@ CRITICAL CONSTRAINTS — read before generating anything:
     student to explain relationships, compare approaches, or analyse implications
     as described in the context.  If the context only supports trivial recall,
     set insufficient_context to true.
+
+EXAM READABILITY RULES — the generated question will appear on a printed exam:
+11. The question must be SELF-CONTAINED.  A student reading the exam will NOT
+    have any "context block" or "provided text".
+    NEVER use phrases like:
+      "from the provided context", "according to the provided text",
+      "based on the context", "the given passage", "the context states",
+      "using the provided", "in the provided material".
+    Write the question as a normal standalone exam question.
+    WRONG:  "Using the provided relationship curves between TP and Temp…"
+    RIGHT:  "Explain how changes in Total Phosphorus affect water transparency…"
+12. Do NOT create questions that require looking at graphs, figures, charts,
+    diagrams, curves, tables, or images.  The student will only have text on
+    the exam paper — no visual elements.  If a question must reference visual
+    data to be answerable, set insufficient_context to true instead.
 """
 
 ESSAY_GENERATION_USER = """\
@@ -36,6 +51,7 @@ Create {count} essay/development question(s) based on the following course mater
 {context}
 --- END CONTEXT ---
 
+Course subject   : {course_subject}
 Difficulty level : {difficulty}
 Target Bloom     : {target_bloom}
 Topic focus      : {topic}

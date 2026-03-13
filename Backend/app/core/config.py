@@ -77,8 +77,8 @@ class Settings(BaseSettings):
     EMBEDDING_DIM: int = 384
 
     # ── Chunking ─────────────────────────────────────────────────
-    CHUNK_SIZE: int = 3000
-    CHUNK_OVERLAP: int = 400
+    CHUNK_SIZE: int = 1500
+    CHUNK_OVERLAP: int = 200
 
     # ── Rate limiting ─────────────────────────────────────────────
     # Tokens per minute sent to the LLM provider.

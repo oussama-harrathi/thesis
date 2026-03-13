@@ -416,15 +416,148 @@ def check_length_outlier(options: list[McqOption]) -> DistractorIssue | None:
     return None
 
 
+# ── Semantic distractor checks ────────────────────────────────────────────────
+
+# Stop-words excluded from token overlap comparisons.
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "can", "could", "must", "of", "in", "to",
+    "for", "with", "on", "at", "by", "from", "as", "into", "about",
+    "and", "or", "but", "not", "no", "if", "then", "than", "so",
+    "it", "its", "this", "that", "these", "those", "which", "what",
+    "who", "whom", "there", "their", "they", "he", "she", "we", "you",
+})
+
+# Regex to extract meaningful tokens (alphanumeric sequences ≥ 2 chars).
+_TOKEN_RE = re.compile(r"[a-z0-9]{2,}", re.IGNORECASE)
+
+# Mathematical / set-theory symbols that signal formal-logic content.
+_MATH_SYMBOLS = re.compile(r"[∈∉⊆⊂⊇⊃∀∃∧∨¬⇒⇔∩∪⊕⊗≡≠≤≥∞∑∏∫∂∇]")
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    """Extract a set of lower-case non-stop-word tokens from *text*."""
+    return {
+        tok.lower()
+        for tok in _TOKEN_RE.findall(text)
+        if tok.lower() not in _STOP_WORDS
+    }
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Jaccard index between two token sets. Returns 0.0 when both empty."""
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def check_stem_restatement(
+    stem: str, options: list[McqOption],
+) -> list[DistractorIssue]:
+    """
+    Flag distractors that restate / paraphrase the question stem.
+
+    Uses token-level Jaccard similarity (threshold 0.50).  A high overlap
+    means the option is echoing the stem instead of proposing an alternative
+    answer.  Only non-correct options are checked.
+    """
+    stem_tokens = _meaningful_tokens(stem)
+    if len(stem_tokens) < 3:
+        return []  # too short to compare meaningfully
+    issues: list[DistractorIssue] = []
+    for opt in options:
+        if opt.is_correct:
+            continue
+        opt_tokens = _meaningful_tokens(opt.text)
+        if len(opt_tokens) < 2:
+            continue
+        sim = _jaccard(stem_tokens, opt_tokens)
+        if sim >= 0.50:
+            issues.append(
+                DistractorIssue(
+                    severity="warn",
+                    code="stem_restatement",
+                    message=(
+                        f"Option {opt.label} appears to restate the question "
+                        f"stem (token overlap={sim:.0%}): {opt.text!r}"
+                    ),
+                    option_label=opt.label,
+                )
+            )
+    return issues
+
+
+def check_cross_domain_distractors(
+    options: list[McqOption],
+) -> list[DistractorIssue]:
+    """
+    Flag distractors that seem to come from a different domain than the
+    correct answer.
+
+    Heuristic:
+      If the correct answer does NOT contain formal-math symbols but a
+      distractor does (or vice-versa), flag as cross-domain notation
+      mismatch.
+
+    NOTE: We intentionally do NOT flag distractors based on token overlap
+    with the correct answer.  MCQ distractors are *wrong answers* and
+    naturally use different vocabulary — zero word overlap is expected
+    and valid (e.g. "The input is non-numeric" vs "It can learn from data"
+    are both valid options for a neural-network question).
+    """
+    correct_opts = [o for o in options if o.is_correct]
+    if not correct_opts:
+        return []
+    correct = correct_opts[0]
+    correct_has_math = bool(_MATH_SYMBOLS.search(correct.text))
+
+    issues: list[DistractorIssue] = []
+    for opt in options:
+        if opt.is_correct:
+            continue
+        opt_has_math = bool(_MATH_SYMBOLS.search(opt.text))
+
+        # Math-type mismatch: one uses formal symbols, the other doesn't
+        if correct_has_math != opt_has_math and len(opt.text) > 5:
+            issues.append(
+                DistractorIssue(
+                    severity="warn",
+                    code="cross_domain_notation",
+                    message=(
+                        f"Option {opt.label} uses "
+                        f"{'mathematical notation' if opt_has_math else 'plain text'} "
+                        f"while the correct answer uses "
+                        f"{'mathematical notation' if correct_has_math else 'plain text'}. "
+                        f"This makes the distractor implausible: {opt.text!r}"
+                    ),
+                    option_label=opt.label,
+                )
+            )
+
+    return issues
+
+
 def evaluate_distractor_issues(
     question_id: uuid.UUID,
     options: list[McqOption],
+    *,
+    stem: str | None = None,
 ) -> DistractorValidationResult:
     """
     Run all distractor checks against *options* and return a result.
 
     This is a **pure function** — it does not touch the database.
     Call it from validate_mcq_distractors or directly in unit tests.
+
+    Parameters
+    ----------
+    question_id : UUID of the checked question.
+    options     : List of McqOption rows.
+    stem        : Optional question stem for semantic checks
+                  (restatement, cross-domain).
     """
     issues: list[DistractorIssue] = []
 
@@ -441,6 +574,11 @@ def evaluate_distractor_issues(
         issues.extend(check_catch_all_phrases(options))
         if (issue := check_length_outlier(options)) is not None:
             issues.append(issue)
+
+        # Semantic checks — require stem for restatement, always run cross-domain
+        if stem:
+            issues.extend(check_stem_restatement(stem, options))
+        issues.extend(check_cross_domain_distractors(options))
 
     # Determine outcome
     if has_fail or any(i.severity == "fail" for i in issues):
@@ -994,7 +1132,11 @@ class ValidationService:
         -------
         DistractorValidationResult with outcome, score, and issue list.
         """
-        # ── Fetch options ──────────────────────────────────────────────
+        # ── Fetch question stem + options ──────────────────────────────
+        q_stmt = select(Question.body).where(Question.id == question_id)
+        q_result = await db.execute(q_stmt)
+        stem: str | None = q_result.scalar_one_or_none()
+
         stmt = (
             select(McqOption)
             .where(McqOption.question_id == question_id)
@@ -1004,7 +1146,9 @@ class ValidationService:
         options: list[McqOption] = list(result.scalars().all())
 
         # ── Evaluate (pure, no DB) ─────────────────────────────────────
-        validation_result = evaluate_distractor_issues(question_id, options)
+        validation_result = evaluate_distractor_issues(
+            question_id, options, stem=stem,
+        )
 
         logger.debug(
             "distractor_validation: question=%s outcome=%s issues=%d",

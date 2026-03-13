@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Sequence
+from typing import Any, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,17 +64,22 @@ from app.schemas.llm_outputs import (
 from app.services.context_builder import ContextBuilder
 from app.services.diversity_service import DiversityContext, DiversityService
 from app.services.retrieval_service import MIN_CONTEXT_CHUNKS, RetrievalService, RetrievedChunk
-from app.services.validation_service import CorrectnessResult, ValidationService
-from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_duplicate_question, is_excluded_for_generation, should_reject_trivial
+from app.services.validation_service import (
+    CorrectnessResult,
+    ValidationService,
+    check_cross_domain_distractors,
+    check_stem_restatement,
+)
+from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_duplicate_question, is_excluded_for_generation, should_reject_context_leak, should_reject_trivial
 from app.utils.text_normalization import normalize_mcs_notation
 
 logger = logging.getLogger(__name__)
 
 # Bump these strings whenever the corresponding prompt templates change.
-MCQ_PROMPT_VERSION = "mcq-v4"
-TF_PROMPT_VERSION = "tf-v3"
-SA_PROMPT_VERSION = "sa-v2"
-ESSAY_PROMPT_VERSION = "essay-v1"
+MCQ_PROMPT_VERSION = "mcq-v5"
+TF_PROMPT_VERSION = "tf-v4"
+SA_PROMPT_VERSION = "sa-v3"
+ESSAY_PROMPT_VERSION = "essay-v2"
 
 
 class QuestionGenerationService:
@@ -116,11 +121,14 @@ class QuestionGenerationService:
         generation_settings: GenerationSettings | None = None,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         _out_chunk_ids: list[uuid.UUID] | None = None,
+        _out_rejected_stems: list[str] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
+        rejected_stems: list[str] | None = None,
+        course_subject: str = "",
     ) -> list[Question]:
         """
         Generate *count* MCQ question(s) grounded in the course material.
@@ -197,6 +205,8 @@ class QuestionGenerationService:
             difficulty=difficulty,
             count=count,
             target_bloom=bloom,
+            rejected_stems=rejected_stems,
+            course_subject=course_subject,
         )
 
         # ── 3. Call LLM ────────────────────────────────────────────────
@@ -260,6 +270,28 @@ class QuestionGenerationService:
                     q_output.stem[:80],
                 )
                 continue
+
+            # Pre-persist distractor quality gate — reject questions with
+            # obviously implausible distractors (cross-domain, stem echoes)
+            # BEFORE they reach the database.
+            _fake_opts: list[Any] = [
+                type("_O", (), {"label": o.key, "text": o.text, "is_correct": o.is_correct})()
+                for o in q_output.options
+            ]
+            _quality_issues = (
+                check_stem_restatement(q_output.stem, _fake_opts)  # type: ignore[arg-type]
+                + check_cross_domain_distractors(_fake_opts)  # type: ignore[arg-type]
+            )
+            if _quality_issues:
+                issue_msgs = "; ".join(i.message for i in _quality_issues)
+                logger.warning(
+                    "generate_mcq: POOR DISTRACTORS — %d issue(s) for stem=%r: %s — skipping",
+                    len(_quality_issues), q_output.stem[:80], issue_msgs,
+                )
+                if _out_rejected_stems is not None:
+                    _out_rejected_stems.append(q_output.stem)
+                continue
+
             # Duplicate detection across the current generation job.
             if used_question_stems is not None:
                 is_dup, sim = is_duplicate_question(q_output.stem, used_question_stems)
@@ -274,6 +306,13 @@ class QuestionGenerationService:
                 logger.warning(
                     "generate_mcq: TRIVIAL stem for %s/%s — skipping stem=%r",
                     difficulty, bloom, q_output.stem[:80],
+                )
+                continue
+            # Context-leak guard: reject questions that mention "the provided context" etc.
+            if should_reject_context_leak(q_output.stem):
+                logger.warning(
+                    "generate_mcq: CONTEXT LEAK in stem=%r — skipping",
+                    q_output.stem[:80],
                 )
                 continue
 
@@ -547,6 +586,7 @@ class QuestionGenerationService:
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
+        course_subject: str = "",
     ) -> list[Question]:
         """
         Generate *count* True/False question(s) grounded in the course material.
@@ -608,6 +648,7 @@ class QuestionGenerationService:
             difficulty=difficulty,
             count=count,
             target_bloom=bloom,
+            course_subject=course_subject,
         )
 
         # ── 3. Call LLM ────────────────────────────────────────────────
@@ -671,6 +712,13 @@ class QuestionGenerationService:
                 logger.warning(
                     "generate_true_false: TRIVIAL for %s/%s — skipping statement=%r",
                     difficulty, bloom, q_output.statement[:80],
+                )
+                continue
+            # Context-leak guard
+            if should_reject_context_leak(q_output.statement):
+                logger.warning(
+                    "generate_true_false: CONTEXT LEAK in statement=%r — skipping",
+                    q_output.statement[:80],
                 )
                 continue
 
@@ -798,6 +846,7 @@ class QuestionGenerationService:
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
+        course_subject: str = "",
     ) -> list[Question]:
         """
         Generate *count* Short Answer question(s) grounded in the course material.
@@ -863,6 +912,7 @@ class QuestionGenerationService:
             count=count,
             target_bloom=bloom,
             non_triviality_block=non_trivial_block,
+            course_subject=course_subject or "General",
         )
         prompt = f"{SHORT_ANSWER_GENERATION_SYSTEM}\n---\n{user_section}"
 
@@ -938,6 +988,13 @@ class QuestionGenerationService:
                 logger.warning(
                     "generate_short_answer: TRIVIAL for %s/%s — skipping q=%r",
                     difficulty, bloom, q_output.question[:80],
+                )
+                continue
+            # Context-leak guard
+            if should_reject_context_leak(q_output.question):
+                logger.warning(
+                    "generate_short_answer: CONTEXT LEAK in q=%r — skipping",
+                    q_output.question[:80],
                 )
                 continue
 
@@ -1030,6 +1087,7 @@ class QuestionGenerationService:
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
+        course_subject: str = "",
     ) -> list[Question]:
         """
         Generate *count* Essay/Development question(s) grounded in course material.
@@ -1093,6 +1151,7 @@ class QuestionGenerationService:
             difficulty=difficulty,
             count=count,
             target_bloom=bloom,
+            course_subject=course_subject,
         )
 
         # ── 3. Call LLM ────────────────────────────────────────────────
@@ -1165,6 +1224,13 @@ class QuestionGenerationService:
                 logger.warning(
                     "generate_essay: TRIVIAL for %s/%s — skipping q=%r",
                     difficulty, bloom, q_output.question[:80],
+                )
+                continue
+            # Context-leak guard
+            if should_reject_context_leak(q_output.question):
+                logger.warning(
+                    "generate_essay: CONTEXT LEAK in q=%r — skipping",
+                    q_output.question[:80],
                 )
                 continue
 
@@ -1626,6 +1692,8 @@ class QuestionGenerationService:
         difficulty: str,
         count: int,
         target_bloom: str = "apply",
+        rejected_stems: list[str] | None = None,
+        course_subject: str = "",
     ) -> str:
         """
         Combine the MCQ system message and formatted user message into a
@@ -1643,7 +1711,15 @@ class QuestionGenerationService:
             target_bloom=target_bloom,
             non_triviality_block=non_trivial_block,
             stem_type_hints=stem_hints,
+            course_subject=course_subject or "General",
         )
+        # If previous attempts produced rejected stems, tell the LLM to avoid them.
+        if rejected_stems:
+            avoid_block = "\n\nIMPORTANT — The following question stems were already tried and REJECTED. "\
+                "Generate a COMPLETELY DIFFERENT question about a different aspect of the topic:\n"
+            for i, stem in enumerate(rejected_stems, 1):
+                avoid_block += f"  {i}. {stem}\n"
+            user_section += avoid_block
         return f"{MCQ_GENERATION_SYSTEM}\n---\n{user_section}"
 
     @staticmethod
@@ -1654,6 +1730,7 @@ class QuestionGenerationService:
         difficulty: str,
         count: int,
         target_bloom: str = "apply",
+        course_subject: str = "",
     ) -> str:
         """Combine the TF system + user messages into a single prompt string."""
         non_trivial_block = QuestionGenerationService._build_non_triviality_block(
@@ -1666,6 +1743,7 @@ class QuestionGenerationService:
             count=count,
             target_bloom=target_bloom,
             non_triviality_block=non_trivial_block,
+            course_subject=course_subject or "General",
         )
         return f"{TF_GENERATION_SYSTEM}\n---\n{user_section}"
 
@@ -1677,6 +1755,7 @@ class QuestionGenerationService:
         difficulty: str,
         count: int,
         target_bloom: str = "analyze",
+        course_subject: str = "",
     ) -> str:
         """Combine the Essay system + user messages into a single prompt string."""
         _response_length_map = {
@@ -1696,5 +1775,6 @@ class QuestionGenerationService:
             target_bloom=target_bloom,
             response_length=response_length,
             non_triviality_block=non_trivial_block,
+            course_subject=course_subject or "General",
         )
         return f"{ESSAY_GENERATION_SYSTEM}\n---\n{user_section}"

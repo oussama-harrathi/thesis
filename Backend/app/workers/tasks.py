@@ -343,6 +343,16 @@ def generate_from_blueprint(
             len(penalize_chunk_ids),
         )
 
+        # ── Detect course subject (cached after first call) ─────────────
+        from app.services.course_subject_service import detect_course_subject
+        async with async_session_factory() as db:
+            course_subject = await detect_course_subject(db, course_id)
+            await db.commit()
+        if course_subject:
+            logger.info(
+                "generate_from_blueprint: course subject = %r", course_subject,
+            )
+
         # ── Job-level diversity state ─────────────────────────────────
         # chunk IDs used across ALL slots; passed to retrieval to avoid reuse.
         used_chunk_ids: set[uuid.UUID] = set()
@@ -416,6 +426,10 @@ def generate_from_blueprint(
             # subsequent retries so the LLM always gets a fresh context window.
             retry_exclude_chunk_ids: set[uuid.UUID] = set()
 
+            # Stems rejected by quality gate (MCQ only) — passed to the LLM on
+            # retry so it generates a different question.
+            slot_rejected_stems: list[str] = []
+
             # Derive Bloom target for this slot.
             base_bloom = DEFAULT_BLOOM_FOR_DIFFICULTY.get(diff_str, "apply")
 
@@ -445,8 +459,24 @@ def generate_from_blueprint(
                 # differently and doesn't keep surfacing the same top chunks.
                 attempt_seed = generation_seed ^ (attempt * 0x9E3779B9)
 
-                # Combine job-level used chunks with this slot's retry-poisoned chunks.
-                effective_exclude = used_chunk_ids | retry_exclude_chunk_ids
+                # Progressive chunk-exclusion relaxation:
+                #   attempt 1: retry-failed chunks excluded; used chunks penalised
+                #   attempt 2: only used chunks penalised (drop retry poisons)
+                #   attempt 3: no exclusion at all — completely fresh pool
+                if attempt == 1:
+                    effective_exclude = set(retry_exclude_chunk_ids)
+                    effective_penalize = penalize_chunk_ids | used_chunk_ids
+                elif attempt == 2:
+                    effective_exclude = set()  # drop retry poisons too
+                    effective_penalize = penalize_chunk_ids | used_chunk_ids
+                else:
+                    effective_exclude = set()  # fully open
+                    effective_penalize = set()  # no penalties either
+                    logger.info(
+                        "generate_from_blueprint: %s — attempt %d: "
+                        "chunk exclusion fully relaxed (fresh pool)",
+                        item_label, attempt,
+                    )
 
                 logger.info(
                     "generate_from_blueprint: %s — attempt %d/%d "
@@ -458,6 +488,7 @@ def generate_from_blueprint(
                 async with async_session_factory() as db:
                     try:
                         if q_type == QuestionType.mcq:
+                            _rejected_this: list[str] = []
                             generated = await svc.generate_mcq(
                                 db,
                                 question_set_id=qs_uuid,
@@ -469,12 +500,16 @@ def generate_from_blueprint(
                                 retrieval_query=slot_retrieval_query,
                                 exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
+                                _out_rejected_stems=_rejected_this,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
-                                penalize_chunk_ids=penalize_chunk_ids,
+                                penalize_chunk_ids=effective_penalize,
+                                rejected_stems=slot_rejected_stems or None,
+                                course_subject=course_subject,
                             )
+                            slot_rejected_stems.extend(_rejected_this)
                         elif q_type == QuestionType.true_false:
                             generated = await svc.generate_true_false(
                                 db,
@@ -491,7 +526,8 @@ def generate_from_blueprint(
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
-                                penalize_chunk_ids=penalize_chunk_ids,
+                                penalize_chunk_ids=effective_penalize,
+                                course_subject=course_subject,
                             )
                         elif q_type == QuestionType.short_answer:
                             generated = await svc.generate_short_answer(
@@ -509,7 +545,8 @@ def generate_from_blueprint(
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
-                                penalize_chunk_ids=penalize_chunk_ids,
+                                penalize_chunk_ids=effective_penalize,
+                                course_subject=course_subject,
                             )
                         elif q_type == QuestionType.essay:
                             generated = await svc.generate_essay(
@@ -527,7 +564,8 @@ def generate_from_blueprint(
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
-                                penalize_chunk_ids=penalize_chunk_ids,
+                                penalize_chunk_ids=effective_penalize,
+                                course_subject=course_subject,
                             )
                         else:
                             logger.warning(

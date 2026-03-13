@@ -32,6 +32,82 @@ services:
       timeout: 5s
       retries: 5
 
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    container_name: exam_builder_backend
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - backend_data:/app/data        # uploads + exports persist across rebuilds
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/exam_builder
+      DATABASE_URL_SYNC: postgresql+psycopg2://postgres:postgres@postgres:5432/exam_builder
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: "false"
+      # LLM keys — set in .env or pass at runtime
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:-}
+      OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-https://api.groq.com/openai/v1}
+      OPENAI_COMPATIBLE_MODEL: ${OPENAI_COMPATIBLE_MODEL:-llama-3.3-70b-versatile}
+      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      LLM_SECOND_FALLBACK_PROVIDER: ${LLM_SECOND_FALLBACK_PROVIDER:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      CORS_ORIGINS: '["http://localhost:5173","http://localhost:80","http://localhost"]'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery_worker:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    container_name: exam_builder_celery
+    restart: unless-stopped
+    entrypoint: []
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info --pool=solo
+      --without-gossip --without-mingle
+    volumes:
+      - backend_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/exam_builder
+      DATABASE_URL_SYNC: postgresql+psycopg2://postgres:postgres@postgres:5432/exam_builder
+      REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:-}
+      OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-https://api.groq.com/openai/v1}
+      OPENAI_COMPATIBLE_MODEL: ${OPENAI_COMPATIBLE_MODEL:-llama-3.3-70b-versatile}
+      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      LLM_SECOND_FALLBACK_PROVIDER: ${LLM_SECOND_FALLBACK_PROVIDER:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash-lite}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    container_name: exam_builder_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:
   redis_data:
+  backend_data:

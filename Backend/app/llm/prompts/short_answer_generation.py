@@ -18,6 +18,18 @@ CRITICAL CONSTRAINTS — read before generating anything:
    that merely ask for a definition ("What is X?", "Define X").  Prefer questions
    that require explanation, comparison, application, or analysis of the material.
    If the context only supports trivial recall, set insufficient_context to true.
+
+EXAM READABILITY RULES — the generated question will appear on a printed exam:
+8. The question must be SELF-CONTAINED.  A student reading the exam will NOT
+   have any "context block" or "provided text".
+   NEVER use phrases like:
+     "from the provided context", "according to the provided text",
+     "based on the context", "the given passage", "the context states",
+     "using the provided", "in the provided material".
+   Write the question as a normal standalone exam question.
+9. Do NOT create questions that require looking at graphs, figures, charts,
+   diagrams, curves, tables, or images.  The student will only have text on
+   the exam paper — no visual elements.
 """
 
 SHORT_ANSWER_GENERATION_USER = """\
@@ -27,6 +39,7 @@ Create {count} short-answer question(s) based on the following course material c
 {context}
 --- END CONTEXT ---
 
+Course subject   : {course_subject}
 Difficulty level : {difficulty}
 Topic focus      : {topic}
 Target Bloom     : {target_bloom}
