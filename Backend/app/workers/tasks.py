@@ -284,6 +284,15 @@ def generate_from_blueprint(
         "essay":        "discuss compare analyze relationship impact",
     }
 
+    # Additional retrieval angles used only in rescue mode when a slot failed
+    # all normal attempts.  These suffixes push the query embedding toward
+    # different semantic neighborhoods instead of repeating the same context.
+    _RESCUE_QUERY_SUFFIXES: tuple[str, ...] = (
+        "application scenario compare reasoning",
+        "mechanism process causal explanation",
+        "limitations tradeoff evaluation synthesis",
+    )
+
     def _build_slot_query(topic_name: str, q_type_value: str) -> str:
         suffix = _SLOT_QUERY_SUFFIXES.get(q_type_value, "")
         # When the topic name is the synthetic fallback "General" it adds no
@@ -295,6 +304,8 @@ def generate_from_blueprint(
 
     # Maximum LLM attempts per individual question before marking it failed.
     MAX_SLOT_ATTEMPTS = 3
+    # Extra rescue attempts after MAX_SLOT_ATTEMPTS are exhausted.
+    MAX_SLOT_RESCUE_ATTEMPTS = 3
 
     async def _run_generation() -> dict[str, Any]:
         """
@@ -630,6 +641,167 @@ def generate_from_blueprint(
                             item_label, attempt, exc, exc_info=True,
                         )
                         await db.rollback()
+
+            # Rescue phase: when all standard attempts fail, force alternate
+            # chunk neighborhoods by (a) keeping failed chunks excluded and
+            # (b) perturbing the retrieval query with different semantic angles.
+            if not generated_this and MAX_SLOT_RESCUE_ATTEMPTS > 0:
+                rescue_exclude_chunk_ids: set[uuid.UUID] = set(retry_exclude_chunk_ids)
+                for rescue_idx in range(1, MAX_SLOT_RESCUE_ATTEMPTS + 1):
+                    chunk_ids_this_slot = []
+                    rescue_suffix = _RESCUE_QUERY_SUFFIXES[
+                        (rescue_idx - 1) % len(_RESCUE_QUERY_SUFFIXES)
+                    ]
+                    rescue_query = f"{slot_retrieval_query} {rescue_suffix}".strip()
+                    rescue_seed = generation_seed ^ (0xA5A5A5A5 + rescue_idx * 0x45D9F3B)
+
+                    logger.info(
+                        "generate_from_blueprint: %s — rescue %d/%d "
+                        "(exclude=%d query=%r)",
+                        item_label,
+                        rescue_idx,
+                        MAX_SLOT_RESCUE_ATTEMPTS,
+                        len(rescue_exclude_chunk_ids),
+                        rescue_query,
+                    )
+
+                    async with async_session_factory() as db:
+                        try:
+                            if q_type == QuestionType.mcq:
+                                _rejected_this = []
+                                generated = await svc.generate_mcq(
+                                    db,
+                                    question_set_id=qs_uuid,
+                                    course_id=course_id,
+                                    topic_id=topic_id,
+                                    topic_name=topic_name,
+                                    difficulty=diff_str,
+                                    count=1,
+                                    retrieval_query=rescue_query,
+                                    exclude_chunk_ids=rescue_exclude_chunk_ids,
+                                    _out_chunk_ids=chunk_ids_this_slot,
+                                    _out_rejected_stems=_rejected_this,
+                                    used_question_stems=used_question_stems,
+                                    target_bloom=base_bloom,
+                                    diversity_ctx=diversity_ctx,
+                                    generation_seed=rescue_seed,
+                                    penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
+                                    rejected_stems=slot_rejected_stems or None,
+                                    course_subject=course_subject,
+                                )
+                                slot_rejected_stems.extend(_rejected_this)
+                            elif q_type == QuestionType.true_false:
+                                generated = await svc.generate_true_false(
+                                    db,
+                                    question_set_id=qs_uuid,
+                                    course_id=course_id,
+                                    topic_id=topic_id,
+                                    topic_name=topic_name,
+                                    difficulty=diff_str,
+                                    count=1,
+                                    retrieval_query=rescue_query,
+                                    exclude_chunk_ids=rescue_exclude_chunk_ids,
+                                    _out_chunk_ids=chunk_ids_this_slot,
+                                    used_question_stems=used_question_stems,
+                                    target_bloom=base_bloom,
+                                    diversity_ctx=diversity_ctx,
+                                    generation_seed=rescue_seed,
+                                    penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
+                                    course_subject=course_subject,
+                                )
+                            elif q_type == QuestionType.short_answer:
+                                generated = await svc.generate_short_answer(
+                                    db,
+                                    question_set_id=qs_uuid,
+                                    course_id=course_id,
+                                    topic_id=topic_id,
+                                    topic_name=topic_name,
+                                    difficulty=diff_str,
+                                    count=1,
+                                    retrieval_query=rescue_query,
+                                    exclude_chunk_ids=rescue_exclude_chunk_ids,
+                                    _out_chunk_ids=chunk_ids_this_slot,
+                                    used_question_stems=used_question_stems,
+                                    target_bloom=base_bloom,
+                                    diversity_ctx=diversity_ctx,
+                                    generation_seed=rescue_seed,
+                                    penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
+                                    course_subject=course_subject,
+                                )
+                            elif q_type == QuestionType.essay:
+                                generated = await svc.generate_essay(
+                                    db,
+                                    question_set_id=qs_uuid,
+                                    course_id=course_id,
+                                    topic_id=topic_id,
+                                    topic_name=topic_name,
+                                    difficulty=diff_str,
+                                    count=1,
+                                    retrieval_query=rescue_query,
+                                    exclude_chunk_ids=rescue_exclude_chunk_ids,
+                                    _out_chunk_ids=chunk_ids_this_slot,
+                                    used_question_stems=used_question_stems,
+                                    target_bloom=base_bloom,
+                                    diversity_ctx=diversity_ctx,
+                                    generation_seed=rescue_seed,
+                                    penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
+                                    course_subject=course_subject,
+                                )
+                            else:
+                                generated = []
+
+                            if generated:
+                                generated = generated[:1]
+                                total_generated += len(generated)
+                                generated_this = True
+                                used_chunk_ids.update(chunk_ids_this_slot)
+
+                                try:
+                                    from app.models.exam import BlueprintQuestion as _BPQ
+                                    for _q in generated:
+                                        _bpq = _BPQ(
+                                            blueprint_id=bp_uuid,
+                                            question_id=_q.id,
+                                        )
+                                        db.add(_bpq)
+                                        await db.flush()
+                                except Exception as _bpq_exc:
+                                    logger.warning(
+                                        "generate_from_blueprint: blueprint_questions insert failed for %s: %s",
+                                        item_label,
+                                        _bpq_exc,
+                                    )
+
+                                await db.commit()
+                                logger.info(
+                                    "generate_from_blueprint: %s — OK on rescue %d "
+                                    "(used_chunks=%d chunk_ids=%s)",
+                                    item_label,
+                                    rescue_idx,
+                                    len(used_chunk_ids),
+                                    [str(c)[:8] for c in chunk_ids_this_slot],
+                                )
+                                # Surface the actual rescue retrieval query in diagnostics.
+                                slot_retrieval_query = rescue_query
+                                break
+
+                            last_failure = (
+                                "generation returned 0 questions "
+                                "(context insufficient or LLM refusal)"
+                            )
+                            rescue_exclude_chunk_ids.update(chunk_ids_this_slot)
+                            retry_exclude_chunk_ids.update(chunk_ids_this_slot)
+                            await db.rollback()
+                        except Exception as exc:
+                            last_failure = f"{type(exc).__name__}: {exc}"
+                            logger.error(
+                                "generate_from_blueprint: %s — rescue %d raised %s",
+                                item_label,
+                                rescue_idx,
+                                exc,
+                                exc_info=True,
+                            )
+                            await db.rollback()
 
             if not generated_this:
                 failed_count += 1
