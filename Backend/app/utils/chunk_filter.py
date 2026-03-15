@@ -101,6 +101,98 @@ def is_excluded_for_generation(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Chunk quality scoring
+# ---------------------------------------------------------------------------
+
+_DEFINITION_SIGNAL_RE = re.compile(
+    r"\b(?:is|are|defined as|refers to|means|denotes|called|consists of)\b",
+    re.I,
+)
+_COMPARISON_SIGNAL_RE = re.compile(
+    r"\b(?:compare|compared|contrast|contrasts?|whereas|however|while|unlike|"
+    r"similar(?:ity)?|difference|versus|vs\.?)\b",
+    re.I,
+)
+_CAUSE_EFFECT_SIGNAL_RE = re.compile(
+    r"\b(?:because|therefore|thus|hence|results? in|leads? to|causes?|affects?|"
+    r"depends on|increases?|decreases?|consequence)\b",
+    re.I,
+)
+_FORMULA_RULE_SIGNAL_RE = re.compile(
+    r"(?:=|⇒|⇔|<=|>=|∀|∃|∈|⊆|\\frac|\\sum|\\int|\\prod|\\lim)\s*"
+    r"|(?:\bif\b.+\bthen\b)"
+    r"|\b(?:formula|rule|theorem|lemma|proposition|corollary)\b",
+    re.I,
+)
+_EXCEPTION_SIGNAL_RE = re.compile(
+    r"\b(?:except|unless|only if|provided that|subject to|condition(?:s)?|"
+    r"special case|edge case|otherwise)\b",
+    re.I,
+)
+_RELATIONSHIP_SIGNAL_RE = re.compile(
+    r"\b(?:relationship between|related to|associated with|connected to|"
+    r"interaction between|equivalent to|implies|mapped to|linked to)\b",
+    re.I,
+)
+_METADATA_PENALTY_RE = re.compile(
+    r"^(?:chapter|lecture|week|unit|page)\b|\b(?:copyright|all rights reserved|doi:|isbn)\b",
+    re.I | re.M,
+)
+
+
+def score_generation_chunk(text: str) -> float:
+    """
+    Return a lightweight heuristic quality score for generation-time chunk ranking.
+
+    Higher scores indicate chunks that are more likely to support grounded,
+    professor-style questions: definitions, rules, comparisons, conditions,
+    relationships, and cause/effect explanations.
+    """
+    if not text:
+        return -1.0
+    if is_excluded_for_generation(text):
+        return -2.0
+
+    stripped = text.strip()
+    words = stripped.split()
+    word_count = len(words)
+    sentences = [s for s in re.split(r"[.!?]+", stripped) if s.strip()]
+    sentence_count = len(sentences)
+
+    score = 0.0
+    signal_hits = 0
+    for pattern, weight in (
+        (_DEFINITION_SIGNAL_RE, 0.45),
+        (_COMPARISON_SIGNAL_RE, 0.45),
+        (_CAUSE_EFFECT_SIGNAL_RE, 0.40),
+        (_FORMULA_RULE_SIGNAL_RE, 0.55),
+        (_EXCEPTION_SIGNAL_RE, 0.50),
+        (_RELATIONSHIP_SIGNAL_RE, 0.40),
+    ):
+        if pattern.search(stripped):
+            score += weight
+            signal_hits += 1
+
+    if signal_hits >= 2:
+        score += 0.20
+    if signal_hits >= 4:
+        score += 0.10
+
+    if _METADATA_PENALTY_RE.search(stripped[:200]):
+        score -= 0.35
+    if word_count < 18:
+        score -= 0.35
+    elif word_count < 35:
+        score -= 0.15
+    if sentence_count <= 1 and signal_hits < 2:
+        score -= 0.20
+    if stripped.count("[") >= 3:
+        score -= 0.20
+
+    return score
+
+
+# ---------------------------------------------------------------------------
 # Duplicate question detection  (Jaccard on tokens)
 # ---------------------------------------------------------------------------
 

@@ -63,7 +63,11 @@ from app.schemas.llm_outputs import (
 )
 from app.services.context_builder import ContextBuilder
 from app.services.diversity_service import DiversityContext, DiversityService
-from app.services.retrieval_service import MIN_CONTEXT_CHUNKS, RetrievalService, RetrievedChunk
+from app.services.retrieval_service import (
+    RetrievalService,
+    RetrievedChunk,
+    min_context_chunks_for_difficulty,
+)
 from app.services.validation_service import (
     CorrectnessResult,
     ValidationService,
@@ -101,6 +105,82 @@ class QuestionGenerationService:
         self._retrieval: RetrievalService = retrieval_service or RetrievalService()
         self._validation_svc = ValidationService()
         self._diversity_svc: DiversityService = diversity_service or DiversityService()
+
+    @staticmethod
+    def build_retrieval_query_seed(
+        topic_name: str,
+        question_type: str,
+        difficulty: str,
+    ) -> str:
+        """Build a retrieval seed that reflects both type intent and difficulty."""
+        type_suffixes: dict[str, str] = {
+            QuestionType.mcq.value: "definition concept example explain property",
+            QuestionType.true_false.value: "fact statement property rule characteristic",
+            QuestionType.short_answer.value: "how why describe steps process mechanism",
+            QuestionType.essay.value: "discuss compare analyze relationship impact",
+        }
+        difficulty_suffixes: dict[str, str] = {
+            "easy": "fact definition overview basic understanding",
+            "medium": "compare apply relationship mechanism explain",
+            "hard": "scenario exception inference consequence reasoning",
+        }
+        effective_topic = "" if topic_name.strip().lower() == "general" else topic_name
+        return " ".join(
+            part
+            for part in (
+                effective_topic,
+                type_suffixes.get(question_type, ""),
+                difficulty_suffixes.get(difficulty.lower(), ""),
+            )
+            if part
+        ).strip() or topic_name
+
+    @staticmethod
+    def _build_difficulty_focus_block(difficulty: str) -> str:
+        """Return a concise instruction block describing the intended question style."""
+        diff = difficulty.lower()
+        if diff == "easy":
+            return (
+                "Difficulty intent (EASY): prefer fact recall, core definitions, or "
+                "basic understanding directly stated in the material."
+            )
+        if diff == "hard":
+            return (
+                "Difficulty intent (HARD): prefer scenario-based reasoning, exceptions, "
+                "inference, consequences, or non-obvious conditions grounded in the material."
+            )
+        return (
+            "Difficulty intent (MEDIUM): prefer comparison, application, or explanation "
+            "of relationships/mechanisms from the material."
+        )
+
+    async def _resolve_course_subject(
+        self,
+        db: AsyncSession,
+        *,
+        course_id: uuid.UUID,
+        course_subject: str,
+    ) -> str:
+        """
+        Return a cached course subject, detecting and persisting it on demand.
+
+        The expensive LLM-based subject detection is only triggered when the
+        caller did not already provide a non-empty subject string.
+        """
+        if course_subject.strip():
+            return course_subject
+
+        from app.services.course_subject_service import detect_course_subject
+
+        try:
+            detected = await detect_course_subject(db, course_id)
+            return detected.strip() if detected else ""
+        except Exception as exc:
+            logger.warning(
+                "_resolve_course_subject: subject detection failed for course=%s: %s",
+                course_id, exc,
+            )
+            return ""
 
     # ------------------------------------------------------------------ #
     # MCQ Generation                                                       #
@@ -153,7 +233,10 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks (with course scoping + fallback) ───
-        query = retrieval_query or topic_name
+        query = retrieval_query or self.build_retrieval_query_seed(
+            topic_name, QuestionType.mcq.value, difficulty,
+        )
+        required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
@@ -164,12 +247,14 @@ class QuestionGenerationService:
             exclude_chunk_ids=exclude_chunk_ids,
             penalize_chunk_ids=penalize_chunk_ids,
             generation_seed=generation_seed,
+            difficulty=difficulty,
+            min_required_chunks=required_chunks,
         )
 
         logger.info(
             "generate_mcq: retrieved %d chunks for course=%s topic=%r topic_id=%s "
             "(min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            len(chunks), course_id, topic_name, topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -188,16 +273,19 @@ class QuestionGenerationService:
         # column existed (server_default sets them all to 'instructional').
         # For chunks persisted post-migration this is a fast no-op.
         chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
-        if len(chunks) < MIN_CONTEXT_CHUNKS:
+        if len(chunks) < required_chunks:
             logger.warning(
                 "generate_mcq: SKIP after pre-LLM text safeguard — "
                 "%d chunk(s) remain (need %d) for course=%s topic=%r",
-                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
+                len(chunks), required_chunks, course_id, topic_name,
             )
             return []
 
         # ── 2. Build compact, token-efficient context ──────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         context_text = ContextBuilder.build(chunks)
         prompt = self._build_mcq_prompt(
             context=context_text,
@@ -599,7 +687,10 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks (with course scoping + fallback) ───
-        query = retrieval_query or topic_name
+        query = retrieval_query or self.build_retrieval_query_seed(
+            topic_name, QuestionType.true_false.value, difficulty,
+        )
+        required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
@@ -610,12 +701,14 @@ class QuestionGenerationService:
             exclude_chunk_ids=exclude_chunk_ids,
             penalize_chunk_ids=penalize_chunk_ids,
             generation_seed=generation_seed,
+            difficulty=difficulty,
+            min_required_chunks=required_chunks,
         )
 
         logger.info(
             "generate_true_false: retrieved %d chunks for course=%s topic=%r topic_id=%s "
             "(min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            len(chunks), course_id, topic_name, topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -631,16 +724,19 @@ class QuestionGenerationService:
 
         # ── Defense-in-depth: text-based re-filter ─────────────────────────
         chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
-        if len(chunks) < MIN_CONTEXT_CHUNKS:
+        if len(chunks) < required_chunks:
             logger.warning(
                 "generate_true_false: SKIP after pre-LLM text safeguard — "
                 "%d chunk(s) remain (need %d) for course=%s topic=%r",
-                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
+                len(chunks), required_chunks, course_id, topic_name,
             )
             return []
 
         # ── 2. Build compact, token-efficient context ──────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         context_text = ContextBuilder.build(chunks)
         prompt = self._build_tf_prompt(
             context=context_text,
@@ -860,7 +956,10 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks ─────────────────────────────────
-        query = retrieval_query or topic_name
+        query = retrieval_query or self.build_retrieval_query_seed(
+            topic_name, QuestionType.short_answer.value, difficulty,
+        )
+        required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
@@ -871,12 +970,14 @@ class QuestionGenerationService:
             exclude_chunk_ids=exclude_chunk_ids,
             penalize_chunk_ids=penalize_chunk_ids,
             generation_seed=generation_seed,
+            difficulty=difficulty,
+            min_required_chunks=required_chunks,
         )
 
         logger.info(
             "generate_short_answer: retrieved %d chunks for course=%s topic=%r "
             "topic_id=%s (min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            len(chunks), course_id, topic_name, topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -893,24 +994,29 @@ class QuestionGenerationService:
 
         # ── Defense-in-depth: text-based re-filter ─────────────────────────
         chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
-        if len(chunks) < MIN_CONTEXT_CHUNKS:
+        if len(chunks) < required_chunks:
             logger.warning(
                 "generate_short_answer: SKIP after pre-LLM text safeguard — "
                 "%d chunk(s) remain (need %d) for course=%s topic=%r",
-                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
+                len(chunks), required_chunks, course_id, topic_name,
             )
             return []
 
         # ── 2. Build compact context ───────────────────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         context_text = ContextBuilder.build(chunks)
         non_trivial_block = self._build_non_triviality_block(difficulty, bloom)
+        difficulty_focus_block = self._build_difficulty_focus_block(difficulty)
         user_section = SHORT_ANSWER_GENERATION_USER.format(
             context=context_text,
             topic=topic_name,
             difficulty=difficulty,
             count=count,
             target_bloom=bloom,
+            difficulty_focus_block=difficulty_focus_block,
             non_triviality_block=non_trivial_block,
             course_subject=course_subject or "General",
         )
@@ -1101,7 +1207,10 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks ─────────────────────────────────
-        query = retrieval_query or topic_name
+        query = retrieval_query or self.build_retrieval_query_seed(
+            topic_name, QuestionType.essay.value, difficulty,
+        )
+        required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
@@ -1112,12 +1221,14 @@ class QuestionGenerationService:
             exclude_chunk_ids=exclude_chunk_ids,
             penalize_chunk_ids=penalize_chunk_ids,
             generation_seed=generation_seed,
+            difficulty=difficulty,
+            min_required_chunks=required_chunks,
         )
 
         logger.info(
             "generate_essay: retrieved %d chunks for course=%s topic=%r "
             "topic_id=%s (min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, MIN_CONTEXT_CHUNKS,
+            len(chunks), course_id, topic_name, topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -1134,16 +1245,19 @@ class QuestionGenerationService:
 
         # ── Defense-in-depth: text-based re-filter ─────────────────────────
         chunks = [c for c in chunks if not is_excluded_for_generation(c.content)]
-        if len(chunks) < MIN_CONTEXT_CHUNKS:
+        if len(chunks) < required_chunks:
             logger.warning(
                 "generate_essay: SKIP after pre-LLM text safeguard — "
                 "%d chunk(s) remain (need %d) for course=%s topic=%r",
-                len(chunks), MIN_CONTEXT_CHUNKS, course_id, topic_name,
+                len(chunks), required_chunks, course_id, topic_name,
             )
             return []
 
         # ── 2. Build prompt ────────────────────────────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         context_text = ContextBuilder.build(chunks)
         prompt = self._build_essay_prompt(
             context=context_text,
@@ -1674,6 +1788,15 @@ class QuestionGenerationService:
         """
         if difficulty.lower() == "easy":
             return ""
+        if difficulty.lower() == "hard":
+            return (
+                "Preferred MCQ stem patterns for this difficulty:\n"
+                "  \u2022 \"Given this scenario, which conclusion follows from the material?\"\n"
+                "  \u2022 \"Which exception or limiting condition applies here?\"\n"
+                "  \u2022 \"Which consequence must occur if the stated condition holds?\"\n"
+                "  \u2022 \"Which inference is justified by the rule/theorem and why?\"\n"
+                "  \u2022 \"Which option correctly reasons about a non-obvious case?\""
+            )
         return (
             "Preferred MCQ stem patterns for this difficulty:\n"
             "  \u2022 \"Which of the following is equivalent to …?\"\n"
@@ -1702,6 +1825,9 @@ class QuestionGenerationService:
         non_trivial_block = QuestionGenerationService._build_non_triviality_block(
             difficulty, target_bloom
         )
+        difficulty_focus_block = QuestionGenerationService._build_difficulty_focus_block(
+            difficulty
+        )
         stem_hints = QuestionGenerationService._build_mcq_stem_hints(difficulty)
         user_section = MCQ_GENERATION_USER.format(
             context=context,
@@ -1709,6 +1835,7 @@ class QuestionGenerationService:
             difficulty=difficulty,
             count=count,
             target_bloom=target_bloom,
+            difficulty_focus_block=difficulty_focus_block,
             non_triviality_block=non_trivial_block,
             stem_type_hints=stem_hints,
             course_subject=course_subject or "General",
@@ -1736,12 +1863,16 @@ class QuestionGenerationService:
         non_trivial_block = QuestionGenerationService._build_non_triviality_block(
             difficulty, target_bloom
         )
+        difficulty_focus_block = QuestionGenerationService._build_difficulty_focus_block(
+            difficulty
+        )
         user_section = TF_GENERATION_USER.format(
             context=context,
             topic=topic,
             difficulty=difficulty,
             count=count,
             target_bloom=target_bloom,
+            difficulty_focus_block=difficulty_focus_block,
             non_triviality_block=non_trivial_block,
             course_subject=course_subject or "General",
         )
@@ -1767,6 +1898,9 @@ class QuestionGenerationService:
         non_trivial_block = QuestionGenerationService._build_non_triviality_block(
             difficulty, target_bloom
         )
+        difficulty_focus_block = QuestionGenerationService._build_difficulty_focus_block(
+            difficulty
+        )
         user_section = ESSAY_GENERATION_USER.format(
             context=context,
             topic=topic,
@@ -1774,6 +1908,7 @@ class QuestionGenerationService:
             count=count,
             target_bloom=target_bloom,
             response_length=response_length,
+            difficulty_focus_block=difficulty_focus_block,
             non_triviality_block=non_trivial_block,
             course_subject=course_subject or "General",
         )

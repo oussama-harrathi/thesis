@@ -57,6 +57,7 @@ Target Bloom     : {target_bloom}
 Topic focus      : {topic}
 Suggested response length: {response_length}
 
+{difficulty_focus_block}
 {non_triviality_block}
 
 Return a JSON object with this schema:

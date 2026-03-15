@@ -43,6 +43,7 @@ Course subject   : {course_subject}
 Difficulty level : {difficulty}
 Topic focus      : {topic}
 Target Bloom     : {target_bloom}
+{difficulty_focus_block}
 {non_triviality_block}
 Return a JSON object with this schema:
 {{

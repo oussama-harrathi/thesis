@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, func as sa_func
 
 from app.llm.factory import get_llm_provider
+from app.utils.chunk_filter import is_excluded_for_generation
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,7 @@ Be specific — e.g. "Neural Networks and Machine Learning" rather than just
 _MAX_SAMPLE_CHARS = 6000
 # How many random chunks to pull for sampling.
 _SAMPLE_CHUNK_COUNT = 10
+_RAW_SAMPLE_MULTIPLIER = 3
 
 
 async def detect_course_subject(
@@ -92,7 +94,7 @@ async def detect_course_subject(
         .where(Document.course_id == course_id)
         .where(Chunk.content.isnot(None))
         .order_by(sa_func.random())
-        .limit(_SAMPLE_CHUNK_COUNT)
+        .limit(_SAMPLE_CHUNK_COUNT * _RAW_SAMPLE_MULTIPLIER)
     )
     rows = (await db.execute(stmt)).scalars().all()
     if not rows:
@@ -101,10 +103,14 @@ async def detect_course_subject(
         )
         return ""
 
+    # Prefer instructional chunks when building the subject sample.
+    filtered_rows = [text for text in rows if not is_excluded_for_generation(text)]
+    sample_rows = filtered_rows[:_SAMPLE_CHUNK_COUNT] or rows[:_SAMPLE_CHUNK_COUNT]
+
     # Build excerpt text, capping total length.
     excerpts: list[str] = []
     total = 0
-    for text in rows:
+    for text in sample_rows:
         if total + len(text) > _MAX_SAMPLE_CHARS:
             remaining = _MAX_SAMPLE_CHARS - total
             if remaining > 200:

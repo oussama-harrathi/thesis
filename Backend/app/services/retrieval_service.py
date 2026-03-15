@@ -24,7 +24,7 @@ from app.models.document import Document
 from app.models.topic import Topic, TopicChunkMap
 from app.services.embedding_service import EmbeddingService
 from app.utils.chunk_classifier import ChunkType
-from app.utils.chunk_filter import is_excluded_for_generation
+from app.utils.chunk_filter import is_excluded_for_generation, score_generation_chunk
 
 # Chunk types that must NEVER be returned by retrieval for question generation.
 # Hard-coded — no runtime toggle.  Matching rows are filtered at DB level, not
@@ -43,6 +43,22 @@ logger = logging.getLogger(__name__)
 # legitimately have very few usable chunks.
 MIN_CONTEXT_CHUNKS = 1
 
+_QUALITY_WEIGHT_BY_DIFFICULTY: dict[str, float] = {
+    "easy": 0.03,
+    "medium": 0.07,
+    "hard": 0.11,
+}
+
+
+def min_context_chunks_for_difficulty(difficulty: str) -> int:
+    """Return the minimum grounded chunk count required for a difficulty."""
+    diff = difficulty.lower().strip()
+    if diff == "hard":
+        return 3
+    if diff == "medium":
+        return 2
+    return MIN_CONTEXT_CHUNKS
+
 
 @dataclass
 class RetrievedChunk:
@@ -53,6 +69,7 @@ class RetrievedChunk:
     content: str
     chunk_index: int
     score: float  # cosine similarity (0-1, higher = more relevant)
+    quality_score: float = 0.0
 
 
 class RetrievalService:
@@ -193,6 +210,7 @@ class RetrievalService:
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
         generation_seed: int | None = None,
+        difficulty: str = "medium",
     ) -> list[RetrievedChunk]:
         """
         Slot-driven retrieval: builds a richer query seed from *topic_name* and
@@ -225,6 +243,8 @@ class RetrievalService:
             exclude_chunk_ids=exclude_chunk_ids,
             penalize_chunk_ids=penalize_chunk_ids,
             generation_seed=generation_seed,
+            difficulty=difficulty,
+            min_required_chunks=min_context_chunks_for_difficulty(difficulty),
         )
 
     async def retrieve_for_generation(
@@ -240,6 +260,8 @@ class RetrievalService:
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
         generation_seed: int | None = None,
+        difficulty: str = "medium",
+        min_required_chunks: int | None = None,
     ) -> list[RetrievedChunk]:
         """
         Combined retrieval for question generation, with automatic fallback broadening.
@@ -268,6 +290,13 @@ class RetrievalService:
         """
         if topic_id is None and query is None:
             raise ValueError("At least one of 'query' or 'topic_id' must be provided.")
+
+        required_chunks = max(
+            MIN_CONTEXT_CHUNKS,
+            min_required_chunks
+            if min_required_chunks is not None
+            else min_context_chunks_for_difficulty(difficulty),
+        )
 
         # Fetch extra candidates upfront to compensate for post-retrieval filtering.
         # We request up to 3× requested top_k so we have room after removing
@@ -326,11 +355,11 @@ class RetrievalService:
                 )
 
         # 4. Fallback: broaden if still too few chunks after filtering.
-        if len(combined) < MIN_CONTEXT_CHUNKS and course_id is not None and query:
+        if len(combined) < required_chunks and course_id is not None and query:
             logger.info(
-                "retrieve_for_generation: only %d chunks after filtering; "
-                "broadening to course-wide retrieval (course=%s, query=%r)",
-                len(combined), course_id, (query or "")[:60],
+                "retrieve_for_generation: only %d/%d chunks after filtering; "
+                "broadening to course-wide retrieval (course=%s, query=%r, difficulty=%s)",
+                len(combined), required_chunks, course_id, (query or "")[:60], difficulty,
             )
             # Use 4× to ensure we reach well past whatever text-filtered chunks
             # were already fetched in the first pass (they all sit in seen_ids).
@@ -356,7 +385,7 @@ class RetrievalService:
                     combined.append(c)
             # Second pass: if still too few, allow reuse of exclude_chunk_ids
             # (chunk reuse is better than total generation failure)
-            if len(combined) < MIN_CONTEXT_CHUNKS:
+            if len(combined) < required_chunks:
                 for c in broad_chunks:
                     boilerplate = exclude_noncontent and is_excluded_for_generation(c.content)
                     if (
@@ -376,7 +405,7 @@ class RetrievalService:
         # pull ANY instructional chunks from the course ordered by chunk_index.
         # We trust the DB chunk_type filter here and skip the aggressive text
         # filter so generation can still proceed.
-        if len(combined) < MIN_CONTEXT_CHUNKS and course_id is not None:
+        if len(combined) < required_chunks and course_id is not None:
             logger.warning(
                 "retrieve_for_generation: vector search exhausted — "
                 "falling back to ordered content dump for course=%s",
@@ -421,25 +450,32 @@ class RetrievalService:
             )
 
         # 4. Final check — do not return results that would force hallucination.
-        if len(combined) < MIN_CONTEXT_CHUNKS:
+        if len(combined) < required_chunks:
             logger.warning(
                 "retrieve_for_generation: insufficient context even after broadening "
-                "(%d < %d) for course=%s — returning empty to block LLM call",
-                len(combined), MIN_CONTEXT_CHUNKS, course_id,
+                "(%d < %d) for course=%s difficulty=%s — returning empty to block LLM call",
+                len(combined), required_chunks, course_id, difficulty,
             )
             return []
 
-        # 5. Seeded tie-break sort: within the same 0.05 score band, shuffle
-        #    deterministically so repeated runs pull different chunk representatives.
+        quality_weight = _QUALITY_WEIGHT_BY_DIFFICULTY.get(difficulty.lower(), 0.07)
+        for chunk in combined:
+            chunk.quality_score = score_generation_chunk(chunk.content)
+
+        def _ranking_score(chunk: RetrievedChunk) -> float:
+            return chunk.score + (quality_weight * chunk.quality_score)
+
+        # 5. Rank by semantic similarity plus a lightweight quality bonus.
+        #    The quality bonus is stronger for medium/hard so richer chunks
+        #    win when the vector scores are close.
         if generation_seed is not None:
             import random as _rnd
             rng = _rnd.Random(generation_seed)
-            # Score band = floor(score * 20) / 20  (0.05 precision)
             combined.sort(
-                key=lambda c: (round(c.score * 20) / 20, rng.random()), reverse=True
+                key=lambda c: (_ranking_score(c), c.score, rng.random()), reverse=True
             )
         else:
-            combined.sort(key=lambda c: c.score, reverse=True)
+            combined.sort(key=lambda c: (_ranking_score(c), c.score), reverse=True)
 
         # 6. Penalise historical chunk IDs: prefer chunks not used in previous
         #    runs; fill remainder from penalised pool only when necessary.

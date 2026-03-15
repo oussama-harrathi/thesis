@@ -275,15 +275,6 @@ def generate_from_blueprint(
 
     # ── Steps 3–5: async generation of all slots ──────────────────────
 
-    # Query suffix per question type: makes retrieval pull different chunks
-    # for different cognitive tasks even when the topic name is identical.
-    _SLOT_QUERY_SUFFIXES: dict[str, str] = {
-        "mcq":          "definition concept example explain property",
-        "true_false":   "fact statement property rule characteristic",
-        "short_answer": "how why describe steps process mechanism",
-        "essay":        "discuss compare analyze relationship impact",
-    }
-
     # Additional retrieval angles used only in rescue mode when a slot failed
     # all normal attempts.  These suffixes push the query embedding toward
     # different semantic neighborhoods instead of repeating the same context.
@@ -292,15 +283,6 @@ def generate_from_blueprint(
         "mechanism process causal explanation",
         "limitations tradeoff evaluation synthesis",
     )
-
-    def _build_slot_query(topic_name: str, q_type_value: str) -> str:
-        suffix = _SLOT_QUERY_SUFFIXES.get(q_type_value, "")
-        # When the topic name is the synthetic fallback "General" it adds no
-        # semantic information — prepending it skews the embedding toward generic
-        # boilerplate text and starves the retrieval of real instructional chunks.
-        # Use only the type-specific suffix for the vector search in that case.
-        effective_topic = "" if topic_name.strip().lower() == "general" else topic_name
-        return f"{effective_topic} {suffix}".strip() or topic_name
 
     # Maximum LLM attempts per individual question before marking it failed.
     MAX_SLOT_ATTEMPTS = 3
@@ -321,6 +303,7 @@ def generate_from_blueprint(
         from app.core.database import async_session_factory
         from app.models.job import Job, JobStatus
         from app.models.question import QuestionType
+        from app.models.topic import Topic
         from app.services.diversity_service import DiversityContext, DiversityService
         from app.services.question_generation_service import QuestionGenerationService
         from app.utils.chunk_filter import DEFAULT_BLOOM_FOR_DIFFICULTY, is_trivial_question
@@ -364,6 +347,17 @@ def generate_from_blueprint(
                 "generate_from_blueprint: course subject = %r", course_subject,
             )
 
+        topic_name_map: dict[uuid.UUID, str] = {}
+        topic_ids = {slot.topic_id for slot in slots if slot.topic_id is not None}
+        if topic_ids:
+            async with async_session_factory() as db:
+                topic_rows = (
+                    await db.execute(
+                        select(Topic.id, Topic.name).where(Topic.id.in_(topic_ids))
+                    )
+                ).all()
+            topic_name_map = {row.id: row.name for row in topic_rows}
+
         # ── Job-level diversity state ─────────────────────────────────
         # chunk IDs used across ALL slots; passed to retrieval to avoid reuse.
         used_chunk_ids: set[uuid.UUID] = set()
@@ -384,7 +378,11 @@ def generate_from_blueprint(
                     "question_type": slot.question_type,
                     "difficulty": slot.difficulty,
                     "topic_id": slot.topic_id,
-                    "topic_name": slot.topic_name,
+                    "topic_name": (
+                        topic_name_map.get(slot.topic_id, slot.topic_name)
+                        if slot.topic_id is not None
+                        else slot.topic_name
+                    ),
                 })
 
         # ── Seeded shuffle for cross-run slot order diversity ─────────────
@@ -431,7 +429,9 @@ def generate_from_blueprint(
                 f"type={q_type.value} diff={diff_str} topic={topic_name!r}"
             )
 
-            slot_retrieval_query = _build_slot_query(topic_name, q_type.value)
+            slot_retrieval_query = QuestionGenerationService.build_retrieval_query_seed(
+                topic_name, q_type.value, diff_str,
+            )
 
             # Chunks retrieved in failed attempts within this slot — excluded on
             # subsequent retries so the LLM always gets a fresh context window.
