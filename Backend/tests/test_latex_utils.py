@@ -3,18 +3,27 @@ Unit tests for app.utils.latex
 
 Covers:
   - latex_escape()      — single-pass escaping of all 10 LaTeX special chars
+  - _find_pdflatex()    — resolves PATH and common local installs
   - pdflatex_available() — always returns a bool (no assertion on True/False)
   - write_tex()         — writes content to a file, returns the path
 
 No pdflatex binary is required; compile_pdf is not called.
 """
+import os
 import re
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from app.utils.latex import latex_escape, pdflatex_available, write_tex
+from app.utils.latex import (
+    _find_pdflatex,
+    compile_pdf,
+    latex_escape,
+    pdflatex_available,
+    write_tex,
+)
 
 
 # ── latex_escape ──────────────────────────────────────────────────────────────
@@ -135,6 +144,39 @@ class TestPdflatexAvailable:
         result = pdflatex_available()
         assert isinstance(result, bool)
 
+    def test_find_pdflatex_uses_path_first(self, monkeypatch: pytest.MonkeyPatch):
+        fake = Path(r"C:\tools\pdflatex.exe")
+        monkeypatch.setattr("app.utils.latex.shutil.which", lambda _: str(fake))
+        assert _find_pdflatex() == fake
+
+    def test_find_pdflatex_uses_local_miktex_install(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        miktex_exe = (
+            tmp_path
+            / "Programs"
+            / "MiKTeX"
+            / "miktex"
+            / "bin"
+            / "x64"
+            / "pdflatex.exe"
+        )
+        miktex_exe.parent.mkdir(parents=True)
+        miktex_exe.write_text("", encoding="utf-8")
+
+        monkeypatch.setattr("app.utils.latex.shutil.which", lambda _: None)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "pf"))
+        monkeypatch.setenv("PROGRAMFILES(X86)", str(tmp_path / "pfx86"))
+        monkeypatch.setenv("PATH", "")
+
+        found = _find_pdflatex()
+
+        assert found == miktex_exe
+        assert str(miktex_exe.parent) in os.environ["PATH"].split(os.pathsep)
+
 
 # ── write_tex ─────────────────────────────────────────────────────────────────
 
@@ -169,3 +211,40 @@ class TestWriteTex:
         write_tex("", path)
         assert path.exists()
         assert path.read_text(encoding="utf-8") == ""
+
+
+class TestCompilePdfInvocation:
+    def test_compile_pdf_uses_local_filename_from_output_dir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        fake_pdflatex = tmp_path / "bin" / "pdflatex.exe"
+        fake_pdflatex.parent.mkdir(parents=True)
+        fake_pdflatex.write_text("", encoding="utf-8")
+
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        monkeypatch.chdir(workdir)
+
+        tex_path = Path("data/exports/abc123/exam.tex")
+        tex_path.parent.mkdir(parents=True)
+        tex_path.write_text(r"\documentclass{article}\begin{document}OK\end{document}", encoding="utf-8")
+
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, cwd, capture_output, text, timeout):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            pdf_path = Path(cwd) / "exam.pdf"
+            pdf_path.write_text("pdf", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="")
+
+        monkeypatch.setattr("app.utils.latex._find_pdflatex", lambda: fake_pdflatex)
+        monkeypatch.setattr("app.utils.latex.subprocess.run", fake_run)
+
+        pdf = compile_pdf(tex_path, runs=1)
+
+        assert pdf == tex_path.resolve().with_suffix(".pdf")
+        assert captured["cmd"][-1] == "exam.tex"
+        assert captured["cwd"] == str(tex_path.resolve().parent)

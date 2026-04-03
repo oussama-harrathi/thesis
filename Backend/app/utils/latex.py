@@ -21,6 +21,7 @@ returning the .tex file path instead of a PDF.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -34,6 +35,56 @@ logger = logging.getLogger(__name__)
 
 class LatexError(Exception):
     """Raised when pdflatex compilation fails or is unavailable."""
+
+
+def _ensure_dir_on_path(bin_dir: Path) -> None:
+    """Prepend *bin_dir* to this process PATH when it is missing."""
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    bin_str = str(bin_dir)
+    if bin_str not in parts:
+        os.environ["PATH"] = os.pathsep.join([bin_str, *parts])
+
+
+def _find_pdflatex() -> Path | None:
+    """
+    Return the pdflatex executable path when available.
+
+    We first honor PATH, then probe common Windows install locations for
+    MiKTeX and TeX Live. When we find a local install, we also add its bin
+    directory to this process PATH so child TeX tools are resolvable.
+    """
+    found = shutil.which("pdflatex")
+    if found:
+        return Path(found)
+
+    if os.name != "nt":
+        return None
+
+    env_candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "MiKTeX" / "miktex" / "bin" / "x64" / "pdflatex.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "MiKTeX" / "miktex" / "bin" / "x64" / "pdflatex.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "MiKTeX" / "miktex" / "bin" / "x64" / "pdflatex.exe",
+    ]
+
+    for candidate in env_candidates:
+        if candidate.exists():
+            _ensure_dir_on_path(candidate.parent)
+            return candidate
+
+    texlive_roots = [
+        Path(os.environ.get("PROGRAMFILES", "")) / "texlive",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "texlive",
+    ]
+    for root in texlive_roots:
+        if not root.exists():
+            continue
+        for candidate in root.glob("*\\bin\\win32\\pdflatex.exe"):
+            if candidate.exists():
+                _ensure_dir_on_path(candidate.parent)
+                return candidate
+
+    return None
 
 
 # ── Character escaping ────────────────────────────────────────────
@@ -71,8 +122,8 @@ def latex_escape(text: str) -> str:
 # ── pdflatex availability ─────────────────────────────────────────
 
 def pdflatex_available() -> bool:
-    """Return ``True`` if ``pdflatex`` is on the system PATH."""
-    return shutil.which("pdflatex") is not None
+    """Return ``True`` if ``pdflatex`` is available to this process."""
+    return _find_pdflatex() is not None
 
 
 # ── PDF compilation ───────────────────────────────────────────────
@@ -98,10 +149,12 @@ def compile_pdf(tex_path: Path, *, runs: int = 2) -> Path:
     LatexError
         If ``pdflatex`` is not on PATH, or if any compilation pass fails.
     """
-    if not pdflatex_available():
+    pdflatex_exe = _find_pdflatex()
+    if pdflatex_exe is None:
         raise LatexError("pdflatex is not installed or not on PATH.")
 
-    output_dir = tex_path.parent
+    tex_path = tex_path.resolve()
+    output_dir = tex_path.parent.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pdf_path = output_dir / tex_path.with_suffix(".pdf").name
@@ -116,11 +169,11 @@ def compile_pdf(tex_path: Path, *, runs: int = 2) -> Path:
         try:
             result = subprocess.run(
                 [
-                    "pdflatex",
+                    str(pdflatex_exe),
                     "-interaction=nonstopmode",       # never pause for input
                     "-halt-on-error",                  # exit non-zero on error
                     f"-output-directory={output_dir}",
-                    str(tex_path),
+                    tex_path.name,
                 ],
                 cwd=str(output_dir),
                 capture_output=True,
