@@ -17,7 +17,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from app.models.question import QuestionSet
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 # ── Generation slot ───────────────────────────────────────────────────────────
@@ -98,6 +99,31 @@ def _distribute(total: int, proportions: dict[str, float]) -> dict[str, int]:
         result[fractions[i][0]] += 1
 
     return result
+
+
+def _expand_round_robin(items: list[tuple[_T, int]]) -> list[_T]:
+    """
+    Expand ``[(item, count), ...]`` into a round-robin sequence.
+
+    Example
+    -------
+    ``[(A, 2), (B, 1), (C, 2)]`` -> ``[A, B, C, A, C]``
+
+    This keeps small-count blueprints from clustering all of one type or
+    difficulty together when we later zip type-units with difficulty-units.
+    """
+    remaining = [(item, count) for item, count in items if count > 0]
+    expanded: list[_T] = []
+
+    while remaining:
+        next_round: list[tuple[_T, int]] = []
+        for item, count in remaining:
+            expanded.append(item)
+            if count > 1:
+                next_round.append((item, count - 1))
+        remaining = next_round
+
+    return expanded
 
 
 class BlueprintService:
@@ -339,24 +365,26 @@ class BlueprintService:
             "hard": config.difficulty_mix.hard,
         }
 
-        slots: list[GenerationSlot] = []
+        # Allocate the requested difficulty mix GLOBALLY across the whole blueprint,
+        # then pair those difficulty-units with question-type/topic units in a
+        # round-robin way. This preserves the exact total per type/topic while
+        # avoiding the small-count rounding issue where EASY can disappear
+        # entirely when each type is distributed independently.
+        total_questions = config.question_counts.total
+        difficulty_units = _expand_round_robin([
+            (Difficulty.easy, _distribute(total_questions, diff_props)["easy"]),
+            (Difficulty.medium, _distribute(total_questions, diff_props)["medium"]),
+            (Difficulty.hard, _distribute(total_questions, diff_props)["hard"]),
+        ])
+
+        slot_units: list[tuple[QuestionType, uuid.UUID | None, str]] = []
 
         if config.topic_mix.mode == "auto":
-            for qtype, type_total in type_totals.items():
-                if type_total == 0:
-                    continue
-                diff_counts = _distribute(type_total, diff_props)
-                for diff_str, count in diff_counts.items():
-                    if count > 0:
-                        slots.append(
-                            GenerationSlot(
-                                question_type=qtype,
-                                difficulty=Difficulty(diff_str),
-                                count=count,
-                                topic_id=None,
-                                topic_name="General",
-                            )
-                        )
+            slot_units = _expand_round_robin([
+                ((qtype, None, "General"), type_total)
+                for qtype, type_total in type_totals.items()
+                if type_total > 0
+            ])
 
         else:  # manual
             q_total = config.question_counts.total
@@ -375,18 +403,23 @@ class BlueprintService:
                     t_count = topic_type_counts.get(qtype.value, 0)
                     if t_count == 0:
                         continue
-                    diff_counts = _distribute(t_count, diff_props)
-                    for diff_str, count in diff_counts.items():
-                        if count > 0:
-                            slots.append(
-                                GenerationSlot(
-                                    question_type=qtype,
-                                    difficulty=Difficulty(diff_str),
-                                    count=count,
-                                    topic_id=entry.topic_id,
-                                    topic_name=str(entry.topic_id),
-                                )
-                            )
+                    slot_units.extend(
+                        _expand_round_robin([
+                            ((qtype, entry.topic_id, str(entry.topic_id)), t_count)
+                        ])
+                    )
+
+        slots: list[GenerationSlot] = []
+        for (qtype, topic_id, topic_name), difficulty in zip(slot_units, difficulty_units):
+            slots.append(
+                GenerationSlot(
+                    question_type=qtype,
+                    difficulty=difficulty,
+                    count=1,
+                    topic_id=topic_id,
+                    topic_name=topic_name,
+                )
+            )
 
         return slots
 

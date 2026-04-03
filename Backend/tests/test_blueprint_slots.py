@@ -147,6 +147,22 @@ class TestExpandToSlotsAuto:
         slots = BlueprintService.expand_to_slots(config)
         assert sum(s.count for s in slots) == 12
 
+    def test_global_difficulty_mix_preserves_easy_slots_for_small_blueprint(self):
+        config = BlueprintConfig(
+            question_counts=QuestionTypeCounts(mcq=2, true_false=1, short_answer=2, essay=2),
+            difficulty_mix=DifficultyMix(easy=0.30, medium=0.35, hard=0.35),
+            topic_mix=TopicMix(mode="auto"),
+        )
+
+        slots = BlueprintService.expand_to_slots(config)
+        difficulty_counts = {
+            "easy": sum(1 for s in slots if s.difficulty.value == "easy"),
+            "medium": sum(1 for s in slots if s.difficulty.value == "medium"),
+            "hard": sum(1 for s in slots if s.difficulty.value == "hard"),
+        }
+
+        assert difficulty_counts == {"easy": 2, "medium": 3, "hard": 2}
+
 
 # ── BlueprintService.expand_to_slots (manual mode) ───────────────────────────
 

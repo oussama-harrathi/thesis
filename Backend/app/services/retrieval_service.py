@@ -427,12 +427,12 @@ class RetrievalService:
             )
             emergency_result = await db.execute(emergency_stmt)
             emergency_rows = emergency_result.scalars().all()
+            combined_ids = {c.chunk_id for c in combined}
+            already_used = exclude_chunk_ids or set()
             for ch in emergency_rows:
-                # NOTE: intentionally checking NEITHER seen_ids NOR
-                # exclude_chunk_ids here — the emergency dump is a last-resort
-                # and chunk reuse across slots is acceptable when the
-                # alternative is total generation failure.
-                if ch.id not in {c.chunk_id for c in combined}:
+                # Prefer fresh instructional chunks first; reuse only if the
+                # course cannot satisfy the grounding minimum otherwise.
+                if ch.id not in combined_ids and ch.id not in already_used:
                     combined.append(
                         RetrievedChunk(
                             chunk_id=ch.id,
@@ -442,8 +442,25 @@ class RetrievalService:
                             score=0.50,  # neutral score — not ranked by relevance
                         )
                     )
+                    combined_ids.add(ch.id)
                 if len(combined) >= top_k * 2:
                     break
+            if len(combined) < required_chunks:
+                for ch in emergency_rows:
+                    if ch.id in combined_ids:
+                        continue
+                    combined.append(
+                        RetrievedChunk(
+                            chunk_id=ch.id,
+                            document_id=ch.document_id,
+                            content=ch.content,
+                            chunk_index=ch.chunk_index,
+                            score=0.50,  # neutral score â€” not ranked by relevance
+                        )
+                    )
+                    combined_ids.add(ch.id)
+                    if len(combined) >= top_k * 2:
+                        break
             logger.info(
                 "retrieve_for_generation: emergency dump yielded %d chunk(s) for course=%s",
                 len(combined), course_id,

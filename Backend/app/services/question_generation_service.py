@@ -19,13 +19,15 @@ Generation flow for generate_mcq() and generate_true_false():
   5. For each parsed question:
        a. Insert a Question row.
        b. Insert McqOption rows A–D (MCQ only).
-       c. Insert QuestionSource rows (one per retrieved chunk + source_hint).
+       c. Insert QuestionSource rows for the selected support chunks.
   6. Return the list of persisted Question objects.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import uuid
 from typing import Any, Sequence
 
@@ -44,12 +46,14 @@ from app.llm.prompts.short_answer_generation import (
 )
 from app.llm.prompts.tf_generation import TF_GENERATION_SYSTEM, TF_GENERATION_USER
 from app.models.question import (
+    BloomLevel,
     Difficulty,
     McqOption,
     Question,
     QuestionSource,
     QuestionStatus,
     QuestionType,
+    QuestionValidation,
 )
 from app.schemas.llm_outputs import (
     EssayGenerationOutput,
@@ -71,6 +75,8 @@ from app.services.retrieval_service import (
 from app.services.validation_service import (
     CorrectnessResult,
     ValidationService,
+    _heuristic_bloom,
+    _heuristic_difficulty,
     check_cross_domain_distractors,
     check_stem_restatement,
 )
@@ -84,6 +90,31 @@ MCQ_PROMPT_VERSION = "mcq-v5"
 TF_PROMPT_VERSION = "tf-v4"
 SA_PROMPT_VERSION = "sa-v3"
 ESSAY_PROMPT_VERSION = "essay-v2"
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_VAGUE_COMMON_SENSE_RE = re.compile(
+    r"\b(common sense|foreseeable future|highly likely|unlikely|neutral"
+    r"|too good to be true|practical in the foreseeable future)\b",
+    re.IGNORECASE,
+)
+_EASY_IDENTIFICATION_STEM_RE = re.compile(
+    r"^\s*(which of the following|which statement|what is|what are|"
+    r"who is|when is|where is|identify|name)\b",
+    re.IGNORECASE,
+)
+_MEDIUM_REASONING_SIGNAL_RE = re.compile(
+    r"\b(compare|contrast|relationship|mechanism|process|role|effect|affect|"
+    r"impact|apply|application|use|determine|explain|how|why|difference|"
+    r"similarity|because|therefore|results? in|leads? to|depends on)\b",
+    re.IGNORECASE,
+)
+_HARD_REASONING_SIGNAL_RE = re.compile(
+    r"\b(given that|given (?:a|an|the)|scenario|case|unless|except|"
+    r"under what conditions?|condition|consequence|implication|infer|"
+    r"inference|what follows|follows from|special case|edge case|"
+    r"trade[- ]off|limitation|justify)\b",
+    re.IGNORECASE,
+)
 
 
 class QuestionGenerationService:
@@ -111,8 +142,9 @@ class QuestionGenerationService:
         topic_name: str,
         question_type: str,
         difficulty: str,
+        course_subject: str = "",
     ) -> str:
-        """Build a retrieval seed that reflects both type intent and difficulty."""
+        """Build a retrieval seed that reflects subject, type intent, and difficulty."""
         type_suffixes: dict[str, str] = {
             QuestionType.mcq.value: "definition concept example explain property",
             QuestionType.true_false.value: "fact statement property rule characteristic",
@@ -124,16 +156,22 @@ class QuestionGenerationService:
             "medium": "compare apply relationship mechanism explain",
             "hard": "scenario exception inference consequence reasoning",
         }
-        effective_topic = "" if topic_name.strip().lower() == "general" else topic_name
-        return " ".join(
+        normalized_subject = course_subject.strip()
+        effective_topic = "" if topic_name.strip().lower() == "general" else topic_name.strip()
+        parts: list[str] = []
+        if normalized_subject:
+            parts.append(normalized_subject)
+        if effective_topic and effective_topic.lower() != normalized_subject.lower():
+            parts.append(effective_topic)
+        parts.extend(
             part
             for part in (
-                effective_topic,
                 type_suffixes.get(question_type, ""),
                 difficulty_suffixes.get(difficulty.lower(), ""),
             )
             if part
-        ).strip() or topic_name
+        )
+        return " ".join(parts).strip() or normalized_subject or topic_name
 
     @staticmethod
     def _build_difficulty_focus_block(difficulty: str) -> str:
@@ -153,6 +191,151 @@ class QuestionGenerationService:
             "Difficulty intent (MEDIUM): prefer comparison, application, or explanation "
             "of relationships/mechanisms from the material."
         )
+
+    @staticmethod
+    def _normalize_match_text(text: str) -> str:
+        """Collapse whitespace and lowercase text for chunk/source matching."""
+        return _WHITESPACE_RE.sub(" ", (text or "").strip().lower())
+
+    @staticmethod
+    def _select_support_chunks(
+        chunks: list[RetrievedChunk],
+        *,
+        difficulty: str,
+        source_hint: str | None = None,
+    ) -> list[RetrievedChunk]:
+        """
+        Select the minimum support set to persist and mark as "used".
+
+        We persist/track only the chunk subset that best supports the saved
+        question, rather than every chunk that happened to be retrieved into
+        the LLM context window.
+        """
+        if not chunks:
+            return []
+
+        required = min_context_chunks_for_difficulty(difficulty)
+        selected: list[RetrievedChunk] = []
+        seen_ids: set[uuid.UUID] = set()
+
+        normalized_hint = QuestionGenerationService._normalize_match_text(source_hint or "")
+        if normalized_hint:
+            for chunk in chunks:
+                normalized_content = QuestionGenerationService._normalize_match_text(
+                    chunk.content
+                )
+                if (
+                    normalized_hint in normalized_content
+                    or normalized_content[:160] in normalized_hint
+                ):
+                    selected.append(chunk)
+                    seen_ids.add(chunk.chunk_id)
+                    break
+
+        for chunk in chunks:
+            if chunk.chunk_id in seen_ids:
+                continue
+            selected.append(chunk)
+            seen_ids.add(chunk.chunk_id)
+            if len(selected) >= required:
+                break
+
+        return selected[: max(1, min(required, len(selected)))]
+
+    @staticmethod
+    def _difficulty_gate_reason(text: str, difficulty: str) -> str | None:
+        """
+        Return a rejection reason when *text* is too weak for the target difficulty.
+
+        This is intentionally lightweight: we combine existing difficulty/Bloom
+        heuristics with a small set of regex guards for vague/common-sense and
+        obviously low-cognitive stems.
+        """
+        diff = difficulty.lower().strip()
+        if diff == "easy":
+            return None
+
+        normalized = text.strip()
+        if not normalized:
+            return "empty question text"
+
+        if _VAGUE_COMMON_SENSE_RE.search(normalized):
+            return "vague/common-sense wording"
+
+        heuristic_diff = _heuristic_difficulty(normalized).difficulty
+        heuristic_bloom = _heuristic_bloom(normalized).bloom_level
+        has_medium_signal = bool(_MEDIUM_REASONING_SIGNAL_RE.search(normalized))
+        has_hard_signal = bool(_HARD_REASONING_SIGNAL_RE.search(normalized))
+
+        if diff == "medium":
+            if _EASY_IDENTIFICATION_STEM_RE.match(normalized) and not (
+                has_medium_signal or has_hard_signal
+            ):
+                return "simple identification/recall stem for a medium slot"
+            if heuristic_diff == Difficulty.easy and not (
+                has_medium_signal or has_hard_signal
+            ):
+                return "question reads as easy recall instead of medium reasoning"
+            if heuristic_bloom == BloomLevel.remember and not has_medium_signal:
+                return "medium slot requires explanation, relationship, or application"
+            return None
+
+        if _EASY_IDENTIFICATION_STEM_RE.match(normalized) and not has_hard_signal:
+            return "simple identification/recall stem for a hard slot"
+        if heuristic_bloom in {BloomLevel.remember, BloomLevel.understand} and not has_hard_signal:
+            return "hard slot lacks scenario, exception, inference, or consequence reasoning"
+        if heuristic_diff != Difficulty.hard and not has_hard_signal:
+            return "question does not show hard-level reasoning demands"
+        return None
+
+    @staticmethod
+    def _downgraded_difficulty(text: str, requested_difficulty: str) -> Difficulty:
+        """
+        Return the accepted lower difficulty when the target gate cannot be met.
+
+        We prefer the heuristic classifier's lower estimate when it is genuinely
+        below the requested level; otherwise we step down by exactly one level.
+        """
+        requested = Difficulty(requested_difficulty.lower())
+        heuristic = _heuristic_difficulty(text).difficulty
+        rank = {
+            Difficulty.easy: 0,
+            Difficulty.medium: 1,
+            Difficulty.hard: 2,
+        }
+        if rank[heuristic] < rank[requested]:
+            return heuristic
+        if requested == Difficulty.hard:
+            return Difficulty.medium
+        return Difficulty.easy
+
+    async def _persist_difficulty_downgrade(
+        self,
+        db: AsyncSession,
+        *,
+        question: Question,
+        requested_difficulty: str,
+        accepted_difficulty: str,
+        reason: str,
+    ) -> None:
+        """Persist an audit row explaining why a downgraded question was accepted."""
+        db.add(
+            QuestionValidation(
+                id=uuid.uuid4(),
+                question_id=question.id,
+                validation_type="difficulty_downgrade",
+                passed=True,
+                score=1.0,
+                detail=json.dumps(
+                    {
+                        "requested_difficulty": requested_difficulty,
+                        "accepted_difficulty": accepted_difficulty,
+                        "reason": reason,
+                    }
+                ),
+            )
+        )
+        await db.flush()
 
     async def _resolve_course_subject(
         self,
@@ -201,6 +384,8 @@ class QuestionGenerationService:
         generation_settings: GenerationSettings | None = None,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         _out_chunk_ids: list[uuid.UUID] | None = None,
+        _out_support_chunk_ids: list[uuid.UUID] | None = None,
+        _out_downgraded: list[dict[str, Any]] | None = None,
         _out_rejected_stems: list[str] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
@@ -209,6 +394,7 @@ class QuestionGenerationService:
         penalize_chunk_ids: set[uuid.UUID] | None = None,
         rejected_stems: list[str] | None = None,
         course_subject: str = "",
+        allow_difficulty_downgrade: bool = False,
     ) -> list[Question]:
         """
         Generate *count* MCQ question(s) grounded in the course material.
@@ -233,8 +419,14 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks (with course scoping + fallback) ───
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         query = retrieval_query or self.build_retrieval_query_seed(
-            topic_name, QuestionType.mcq.value, difficulty,
+            topic_name,
+            QuestionType.mcq.value,
+            difficulty,
+            course_subject=course_subject,
         )
         required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
@@ -283,9 +475,6 @@ class QuestionGenerationService:
 
         # ── 2. Build compact, token-efficient context ──────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
-        course_subject = await self._resolve_course_subject(
-            db, course_id=course_id, course_subject=course_subject,
-        )
         context_text = ContextBuilder.build(chunks)
         prompt = self._build_mcq_prompt(
             context=context_text,
@@ -405,6 +594,33 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────
+            accepted_difficulty = difficulty
+            difficulty_gate_reason = self._difficulty_gate_reason(
+                q_output.stem, difficulty
+            )
+            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
+            if difficulty_gate_reason is not None and not downgraded:
+                logger.warning(
+                    "generate_mcq: DIFFICULTY GATE - rejecting %s stem=%r",
+                    difficulty_gate_reason,
+                    q_output.stem[:80],
+                )
+                if _out_rejected_stems is not None:
+                    _out_rejected_stems.append(q_output.stem)
+                continue
+            if downgraded:
+                accepted_difficulty = self._downgraded_difficulty(
+                    q_output.stem, difficulty
+                ).value
+                logger.warning(
+                    "generate_mcq: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "because %s stem=%r",
+                    difficulty,
+                    accepted_difficulty,
+                    difficulty_gate_reason,
+                    q_output.stem[:80],
+                )
+
             q_fp = self._diversity_svc.compute_fingerprint(q_output.stem)
             try:
                 q_emb = await self._diversity_svc.compute_embedding(q_output.stem)
@@ -470,20 +686,44 @@ class QuestionGenerationService:
                 )
 
             try:
+                support_chunks = self._select_support_chunks(
+                    chunks,
+                    difficulty=difficulty,
+                    source_hint=q_output.source_hint,
+                )
                 question = await self._persist_mcq_question(
                     db,
                     q_output=q_output,
                     question_set_id=question_set_id,
-                    difficulty=difficulty,
-                    chunks=chunks,
+                    difficulty=accepted_difficulty,
+                    chunks=support_chunks,
                     insufficient_context=False,
                     fingerprint=q_fp,
                     embedding=q_emb if q_emb else None,
                     generation_run_id=question_set_id,
                 )
                 saved.append(question)
+                if _out_support_chunk_ids is not None:
+                    _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.stem)
+                if difficulty_gate_reason is not None:
+                    await self._persist_difficulty_downgrade(
+                        db,
+                        question=question,
+                        requested_difficulty=difficulty,
+                        accepted_difficulty=accepted_difficulty,
+                        reason=difficulty_gate_reason,
+                    )
+                    if _out_downgraded is not None:
+                        _out_downgraded.append(
+                            {
+                                "question_id": str(question.id),
+                                "requested_difficulty": difficulty,
+                                "accepted_difficulty": accepted_difficulty,
+                                "reason": difficulty_gate_reason,
+                            }
+                        )
                 await self._run_validators(
                     db, question, is_mcq=True,
                     target_difficulty=difficulty, target_bloom=bloom,
@@ -669,12 +909,15 @@ class QuestionGenerationService:
         generation_settings: GenerationSettings | None = None,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         _out_chunk_ids: list[uuid.UUID] | None = None,
+        _out_support_chunk_ids: list[uuid.UUID] | None = None,
+        _out_downgraded: list[dict[str, Any]] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
         course_subject: str = "",
+        allow_difficulty_downgrade: bool = False,
     ) -> list[Question]:
         """
         Generate *count* True/False question(s) grounded in the course material.
@@ -687,8 +930,14 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks (with course scoping + fallback) ───
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         query = retrieval_query or self.build_retrieval_query_seed(
-            topic_name, QuestionType.true_false.value, difficulty,
+            topic_name,
+            QuestionType.true_false.value,
+            difficulty,
+            course_subject=course_subject,
         )
         required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
@@ -734,9 +983,6 @@ class QuestionGenerationService:
 
         # ── 2. Build compact, token-efficient context ──────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
-        course_subject = await self._resolve_course_subject(
-            db, course_id=course_id, course_subject=course_subject,
-        )
         context_text = ContextBuilder.build(chunks)
         prompt = self._build_tf_prompt(
             context=context_text,
@@ -819,6 +1065,31 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────────
+            accepted_difficulty = difficulty
+            difficulty_gate_reason = self._difficulty_gate_reason(
+                q_output.statement, difficulty
+            )
+            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
+            if difficulty_gate_reason is not None and not downgraded:
+                logger.warning(
+                    "generate_true_false: DIFFICULTY GATE - rejecting %s statement=%r",
+                    difficulty_gate_reason,
+                    q_output.statement[:80],
+                )
+                continue
+            if downgraded:
+                accepted_difficulty = self._downgraded_difficulty(
+                    q_output.statement, difficulty
+                ).value
+                logger.warning(
+                    "generate_true_false: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "because %s statement=%r",
+                    difficulty,
+                    accepted_difficulty,
+                    difficulty_gate_reason,
+                    q_output.statement[:80],
+                )
+
             tf_fp = self._diversity_svc.compute_fingerprint(q_output.statement)
             try:
                 tf_emb = await self._diversity_svc.compute_embedding(q_output.statement)
@@ -884,20 +1155,44 @@ class QuestionGenerationService:
                 )
 
             try:
+                support_chunks = self._select_support_chunks(
+                    chunks,
+                    difficulty=difficulty,
+                    source_hint=q_output.source_hint,
+                )
                 question = await self._persist_tf_question(
                     db,
                     q_output=q_output,
                     question_set_id=question_set_id,
-                    difficulty=difficulty,
-                    chunks=chunks,
+                    difficulty=accepted_difficulty,
+                    chunks=support_chunks,
                     insufficient_context=False,
                     fingerprint=tf_fp,
                     embedding=tf_emb if tf_emb else None,
                     generation_run_id=question_set_id,
                 )
                 saved.append(question)
+                if _out_support_chunk_ids is not None:
+                    _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.statement)
+                if difficulty_gate_reason is not None:
+                    await self._persist_difficulty_downgrade(
+                        db,
+                        question=question,
+                        requested_difficulty=difficulty,
+                        accepted_difficulty=accepted_difficulty,
+                        reason=difficulty_gate_reason,
+                    )
+                    if _out_downgraded is not None:
+                        _out_downgraded.append(
+                            {
+                                "question_id": str(question.id),
+                                "requested_difficulty": difficulty,
+                                "accepted_difficulty": accepted_difficulty,
+                                "reason": difficulty_gate_reason,
+                            }
+                        )
                 await self._run_validators(
                     db, question, is_mcq=False,
                     target_difficulty=difficulty, target_bloom=bloom,
@@ -937,12 +1232,15 @@ class QuestionGenerationService:
         generation_settings: GenerationSettings | None = None,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         _out_chunk_ids: list[uuid.UUID] | None = None,
+        _out_support_chunk_ids: list[uuid.UUID] | None = None,
+        _out_downgraded: list[dict[str, Any]] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
         course_subject: str = "",
+        allow_difficulty_downgrade: bool = False,
     ) -> list[Question]:
         """
         Generate *count* Short Answer question(s) grounded in the course material.
@@ -956,8 +1254,14 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks ─────────────────────────────────
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         query = retrieval_query or self.build_retrieval_query_seed(
-            topic_name, QuestionType.short_answer.value, difficulty,
+            topic_name,
+            QuestionType.short_answer.value,
+            difficulty,
+            course_subject=course_subject,
         )
         required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
@@ -1004,9 +1308,6 @@ class QuestionGenerationService:
 
         # ── 2. Build compact context ───────────────────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
-        course_subject = await self._resolve_course_subject(
-            db, course_id=course_id, course_subject=course_subject,
-        )
         context_text = ContextBuilder.build(chunks)
         non_trivial_block = self._build_non_triviality_block(difficulty, bloom)
         difficulty_focus_block = self._build_difficulty_focus_block(difficulty)
@@ -1105,6 +1406,31 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────────
+            accepted_difficulty = difficulty
+            difficulty_gate_reason = self._difficulty_gate_reason(
+                q_output.question, difficulty
+            )
+            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
+            if difficulty_gate_reason is not None and not downgraded:
+                logger.warning(
+                    "generate_short_answer: DIFFICULTY GATE - rejecting %s q=%r",
+                    difficulty_gate_reason,
+                    q_output.question[:80],
+                )
+                continue
+            if downgraded:
+                accepted_difficulty = self._downgraded_difficulty(
+                    q_output.question, difficulty
+                ).value
+                logger.warning(
+                    "generate_short_answer: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "because %s q=%r",
+                    difficulty,
+                    accepted_difficulty,
+                    difficulty_gate_reason,
+                    q_output.question[:80],
+                )
+
             sa_fp = self._diversity_svc.compute_fingerprint(q_output.question)
             try:
                 sa_emb = await self._diversity_svc.compute_embedding(q_output.question)
@@ -1138,19 +1464,43 @@ class QuestionGenerationService:
                     continue
 
             try:
+                support_chunks = self._select_support_chunks(
+                    chunks,
+                    difficulty=difficulty,
+                    source_hint=q_output.source_hint,
+                )
                 question = await self._persist_sa_question(
                     db,
                     q_output=q_output,
                     question_set_id=question_set_id,
-                    difficulty=difficulty,
-                    chunks=chunks,
+                    difficulty=accepted_difficulty,
+                    chunks=support_chunks,
                     fingerprint=sa_fp,
                     embedding=sa_emb if sa_emb else None,
                     generation_run_id=question_set_id,
                 )
                 saved.append(question)
+                if _out_support_chunk_ids is not None:
+                    _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.question)
+                if difficulty_gate_reason is not None:
+                    await self._persist_difficulty_downgrade(
+                        db,
+                        question=question,
+                        requested_difficulty=difficulty,
+                        accepted_difficulty=accepted_difficulty,
+                        reason=difficulty_gate_reason,
+                    )
+                    if _out_downgraded is not None:
+                        _out_downgraded.append(
+                            {
+                                "question_id": str(question.id),
+                                "requested_difficulty": difficulty,
+                                "accepted_difficulty": accepted_difficulty,
+                                "reason": difficulty_gate_reason,
+                            }
+                        )
                 await self._run_validators(db, question, is_mcq=False,
                                            target_difficulty=difficulty, target_bloom=bloom)
                 if len(saved) >= count:
@@ -1188,12 +1538,15 @@ class QuestionGenerationService:
         generation_settings: GenerationSettings | None = None,
         exclude_chunk_ids: set[uuid.UUID] | None = None,
         _out_chunk_ids: list[uuid.UUID] | None = None,
+        _out_support_chunk_ids: list[uuid.UUID] | None = None,
+        _out_downgraded: list[dict[str, Any]] | None = None,
         used_question_stems: list[str] | None = None,
         target_bloom: str | None = None,
         diversity_ctx: DiversityContext | None = None,
         generation_seed: int | None = None,
         penalize_chunk_ids: set[uuid.UUID] | None = None,
         course_subject: str = "",
+        allow_difficulty_downgrade: bool = False,
     ) -> list[Question]:
         """
         Generate *count* Essay/Development question(s) grounded in course material.
@@ -1207,8 +1560,14 @@ class QuestionGenerationService:
         insufficient or grounding validation fails).
         """
         # ── 1. Retrieve context chunks ─────────────────────────────────
+        course_subject = await self._resolve_course_subject(
+            db, course_id=course_id, course_subject=course_subject,
+        )
         query = retrieval_query or self.build_retrieval_query_seed(
-            topic_name, QuestionType.essay.value, difficulty,
+            topic_name,
+            QuestionType.essay.value,
+            difficulty,
+            course_subject=course_subject,
         )
         required_chunks = min_context_chunks_for_difficulty(difficulty)
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
@@ -1255,9 +1614,6 @@ class QuestionGenerationService:
 
         # ── 2. Build prompt ────────────────────────────────────────────
         bloom = target_bloom or DEFAULT_BLOOM_FOR_DIFFICULTY.get(difficulty.lower(), "apply")
-        course_subject = await self._resolve_course_subject(
-            db, course_id=course_id, course_subject=course_subject,
-        )
         context_text = ContextBuilder.build(chunks)
         prompt = self._build_essay_prompt(
             context=context_text,
@@ -1349,6 +1705,31 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────────
+            accepted_difficulty = difficulty
+            difficulty_gate_reason = self._difficulty_gate_reason(
+                q_output.question, difficulty
+            )
+            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
+            if difficulty_gate_reason is not None and not downgraded:
+                logger.warning(
+                    "generate_essay: DIFFICULTY GATE - rejecting %s q=%r",
+                    difficulty_gate_reason,
+                    q_output.question[:80],
+                )
+                continue
+            if downgraded:
+                accepted_difficulty = self._downgraded_difficulty(
+                    q_output.question, difficulty
+                ).value
+                logger.warning(
+                    "generate_essay: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "because %s q=%r",
+                    difficulty,
+                    accepted_difficulty,
+                    difficulty_gate_reason,
+                    q_output.question[:80],
+                )
+
             es_fp = self._diversity_svc.compute_fingerprint(q_output.question)
             try:
                 es_emb = await self._diversity_svc.compute_embedding(q_output.question)
@@ -1382,19 +1763,43 @@ class QuestionGenerationService:
                     continue
 
             try:
+                support_chunks = self._select_support_chunks(
+                    chunks,
+                    difficulty=difficulty,
+                    source_hint=q_output.source_hint,
+                )
                 question = await self._persist_essay_question(
                     db,
                     q_output=q_output,
                     question_set_id=question_set_id,
-                    difficulty=difficulty,
-                    chunks=chunks,
+                    difficulty=accepted_difficulty,
+                    chunks=support_chunks,
                     fingerprint=es_fp,
                     embedding=es_emb if es_emb else None,
                     generation_run_id=question_set_id,
                 )
                 saved.append(question)
+                if _out_support_chunk_ids is not None:
+                    _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.question)
+                if difficulty_gate_reason is not None:
+                    await self._persist_difficulty_downgrade(
+                        db,
+                        question=question,
+                        requested_difficulty=difficulty,
+                        accepted_difficulty=accepted_difficulty,
+                        reason=difficulty_gate_reason,
+                    )
+                    if _out_downgraded is not None:
+                        _out_downgraded.append(
+                            {
+                                "question_id": str(question.id),
+                                "requested_difficulty": difficulty,
+                                "accepted_difficulty": accepted_difficulty,
+                                "reason": difficulty_gate_reason,
+                            }
+                        )
                 await self._run_validators(db, question, is_mcq=False,
                                            target_difficulty=difficulty, target_bloom=bloom)
                 if len(saved) >= count:
