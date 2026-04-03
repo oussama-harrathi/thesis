@@ -301,6 +301,7 @@ export interface JobSummary {
   generated: number
   failed: number
   failure_reasons: string[]
+  downgraded_count?: number
 }
 
 // ── Blueprints ────────────────────────────────────────────────────

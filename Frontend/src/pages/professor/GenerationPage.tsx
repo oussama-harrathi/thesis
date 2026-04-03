@@ -46,6 +46,7 @@ export default function GenerationPage() {
   const isDone = status === 'completed' || status === 'failed'
   const summary = isDone ? parseJobSummary(job?.error) : null
   const isPartial = summary && summary.failed > 0
+  const downgradedCount = summary?.downgraded_count ?? 0
 
   return (
     <div style={s.container}>
@@ -133,17 +134,28 @@ export default function GenerationPage() {
 
           {/* CTA when done */}
           {status === 'completed' && (
-            <div style={s.ctaBox}>
-              <p style={{ margin: '0 0 12px', fontWeight: 600 }}>
-                Questions are ready for review!
-              </p>
-              <Link
-                to={`/courses/${courseId}/questions`}
-                style={s.btnReview}
-              >
-                📋 Go to Question Review →
-              </Link>
-            </div>
+            <>
+              {downgradedCount > 0 && (
+                <div style={s.noticeBox}>
+                  <p style={{ margin: 0, fontWeight: 600 }}>
+                    {downgradedCount === 1
+                      ? '1 question was generated at a reduced difficulty because the available course material could not reliably support the originally requested difficulty.'
+                      : `${downgradedCount} questions were generated at a reduced difficulty because the available course material could not reliably support the originally requested difficulty.`}
+                  </p>
+                </div>
+              )}
+              <div style={s.ctaBox}>
+                <p style={{ margin: '0 0 12px', fontWeight: 600 }}>
+                  Questions are ready for review!
+                </p>
+                <Link
+                  to={`/courses/${courseId}/questions`}
+                  style={s.btnReview}
+                >
+                  📋 Go to Question Review →
+                </Link>
+              </div>
+            </>
           )}
 
           {status === 'failed' && (
@@ -174,6 +186,7 @@ const s: Record<string, React.CSSProperties> = {
   message: { color: '#444', fontSize: '0.9rem', margin: '8px 0' },
   muted: { color: '#999', fontSize: '0.85rem' },
   error: { color: '#dc2626', fontWeight: 500 },
+  noticeBox: { marginTop: 24, padding: '14px 18px', background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: 8, color: '#7c2d12' },
   ctaBox: { marginTop: 24, padding: '16px 20px', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8 },
   btnReview: { display: 'inline-block', padding: '10px 22px', background: '#5c6ac4', color: '#fff', textDecoration: 'none', borderRadius: 6, fontWeight: 700 },
   btnRetry: { display: 'inline-block', padding: '10px 22px', background: '#f0f0f0', color: '#333', textDecoration: 'none', borderRadius: 6, fontWeight: 600 },

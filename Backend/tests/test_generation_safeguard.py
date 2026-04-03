@@ -66,6 +66,113 @@ def _make_real_chunks(n: int = 3) -> list[RetrievedChunk]:
 
 # ── MCQ safeguard ─────────────────────────────────────────────────────────────
 
+def test_general_retrieval_seed_uses_course_subject():
+    """General-slot retrieval should stay anchored to the detected course subject."""
+    query = QuestionGenerationService.build_retrieval_query_seed(
+        "General",
+        "essay",
+        "medium",
+        course_subject="Neural Networks and Machine Learning",
+    )
+
+    assert query.startswith("Neural Networks and Machine Learning")
+
+
+def test_support_chunk_selection_prefers_source_hint_and_caps_by_difficulty():
+    """Only the minimum support set should be tracked, anchored to source_hint when possible."""
+    chunks = [
+        RetrievedChunk(
+            chunk_id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            content="Backpropagation updates weights by propagating error terms.",
+            chunk_index=0,
+            score=0.91,
+        ),
+        RetrievedChunk(
+            chunk_id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            content="Overfitting occurs when a model memorizes the training data.",
+            chunk_index=1,
+            score=0.88,
+        ),
+        RetrievedChunk(
+            chunk_id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            content="A perceptron computes a weighted sum and then applies an activation function.",
+            chunk_index=2,
+            score=0.86,
+        ),
+        RetrievedChunk(
+            chunk_id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            content="Gradient descent reduces loss by following the negative gradient.",
+            chunk_index=3,
+            score=0.84,
+        ),
+    ]
+
+    support = QuestionGenerationService._select_support_chunks(
+        chunks,
+        difficulty="hard",
+        source_hint="A perceptron computes a weighted sum and then applies an activation function.",
+    )
+
+    assert len(support) == 3
+    assert support[0].chunk_id == chunks[2].chunk_id
+
+
+def test_hard_common_sense_question_is_rejected_by_difficulty_gate():
+    """Hard slots should reject vague common-sense / opinion-like questions."""
+    reason = QuestionGenerationService._difficulty_gate_reason(
+        "Given that an AI technique requires common sense, what is the likelihood "
+        "of it being fully practical in the foreseeable future?",
+        "hard",
+    )
+
+    assert reason is not None
+
+
+def test_medium_recall_question_is_rejected_by_difficulty_gate():
+    """Medium slots should reject simple identification-style recall questions."""
+    reason = QuestionGenerationService._difficulty_gate_reason(
+        "Which of the following is a key characteristic of neural networks?",
+        "medium",
+    )
+
+    assert reason is not None
+
+
+def test_hard_scenario_question_passes_difficulty_gate():
+    """Hard slots should allow scenario/inference-style questions."""
+    reason = QuestionGenerationService._difficulty_gate_reason(
+        "Given a neural network that fits the training data well but performs "
+        "poorly on unseen data, which conclusion best explains this outcome?",
+        "hard",
+    )
+
+    assert reason is None
+
+
+def test_downgraded_difficulty_can_drop_hard_question_to_heuristic_level():
+    """Weak hard-slot questions should downgrade to the lower heuristic level."""
+    accepted = QuestionGenerationService._downgraded_difficulty(
+        "How do neural networks contribute to decision-making in complex systems?",
+        "hard",
+    )
+
+    assert accepted.value == "easy"
+
+
+def test_downgraded_difficulty_steps_medium_question_down_to_easy():
+    """Weak medium-slot questions should be accepted as easy when downgraded."""
+    accepted = QuestionGenerationService._downgraded_difficulty(
+        "Which characteristic makes neural networks unique?",
+        "medium",
+    )
+
+    assert accepted.value == "easy"
+
+
 class TestMCQPreLLMSafeguard:
     @pytest.mark.asyncio
     async def test_all_boilerplate_chunks_blocks_llm(self):
@@ -92,6 +199,7 @@ class TestMCQPreLLMSafeguard:
             topic_name="Algorithms",
             difficulty="medium",
             count=2,
+            course_subject="Algorithms",
         )
 
         assert result == []
@@ -129,6 +237,7 @@ class TestMCQPreLLMSafeguard:
             topic_name="Algorithms",
             difficulty="medium",
             count=2,
+            course_subject="Algorithms",
         )
 
         # LLM WAS called (even if it returned insufficient_context)
@@ -156,6 +265,7 @@ class TestMCQPreLLMSafeguard:
             topic_name="Algorithms",
             difficulty="medium",
             count=1,
+            course_subject="Algorithms",
         )
 
         assert result == []
@@ -221,6 +331,7 @@ class TestTrueFalsePreLLMSafeguard:
             topic_name="Sorting",
             difficulty="easy",
             count=2,
+            course_subject="Algorithms",
         )
         assert result == []
         mock_provider.generate_json.assert_not_called()
@@ -248,6 +359,7 @@ class TestShortAnswerPreLLMSafeguard:
             topic_name="Graphs",
             difficulty="medium",
             count=1,
+            course_subject="Algorithms",
         )
         assert result == []
         mock_provider.generate_json.assert_not_called()
@@ -275,6 +387,7 @@ class TestEssayPreLLMSafeguard:
             topic_name="Complexity",
             difficulty="hard",
             count=1,
+            course_subject="Algorithms",
         )
         assert result == []
         mock_provider.generate_json.assert_not_called()
@@ -299,6 +412,7 @@ class TestEssayPreLLMSafeguard:
             topic_name="Complexity",
             difficulty="hard",
             count=1,
+            course_subject="Algorithms",
         )
         assert result == []
         mock_provider.generate_json.assert_not_called()

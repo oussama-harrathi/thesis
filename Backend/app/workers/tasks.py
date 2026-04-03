@@ -363,6 +363,7 @@ def generate_from_blueprint(
         used_chunk_ids: set[uuid.UUID] = set()
         # Question stems/texts generated so far; used for duplicate detection.
         used_question_stems: list[str] = []
+        downgraded_questions: list[dict[str, Any]] = []
         # Per-slot diagnostics stored in job metadata.
         slot_diagnostics: list[dict[str, Any]] = []
         # Trivial fraction guard: if trivial questions exceed this share of
@@ -430,7 +431,10 @@ def generate_from_blueprint(
             )
 
             slot_retrieval_query = QuestionGenerationService.build_retrieval_query_seed(
-                topic_name, q_type.value, diff_str,
+                topic_name,
+                q_type.value,
+                diff_str,
+                course_subject=course_subject,
             )
 
             # Chunks retrieved in failed attempts within this slot — excluded on
@@ -461,33 +465,24 @@ def generate_from_blueprint(
 
             generated_this = False
             last_failure = "unknown"
+            slot_downgraded: list[dict[str, Any]] = []
 
             for attempt in range(1, MAX_SLOT_ATTEMPTS + 1):
                 # Reset per-attempt chunk accumulator so each retry starts clean.
                 chunk_ids_this_slot: list[uuid.UUID] = []
+                support_chunk_ids_this_slot: list[uuid.UUID] = []
+                downgraded_this_attempt: list[dict[str, Any]] = []
 
                 # Vary the seed per-attempt so retrieval tie-breaking shuffles
                 # differently and doesn't keep surfacing the same top chunks.
                 attempt_seed = generation_seed ^ (attempt * 0x9E3779B9)
 
-                # Progressive chunk-exclusion relaxation:
-                #   attempt 1: retry-failed chunks excluded; used chunks penalised
-                #   attempt 2: only used chunks penalised (drop retry poisons)
-                #   attempt 3: no exclusion at all — completely fresh pool
-                if attempt == 1:
-                    effective_exclude = set(retry_exclude_chunk_ids)
-                    effective_penalize = penalize_chunk_ids | used_chunk_ids
-                elif attempt == 2:
-                    effective_exclude = set()  # drop retry poisons too
-                    effective_penalize = penalize_chunk_ids | used_chunk_ids
-                else:
-                    effective_exclude = set()  # fully open
-                    effective_penalize = set()  # no penalties either
-                    logger.info(
+                # All standard retries should try genuinely different chunk sets.
+                # Failed-attempt chunks stay excluded until the rescue phase.
+                effective_exclude = set(retry_exclude_chunk_ids) | set(used_chunk_ids)
+                effective_penalize = set(penalize_chunk_ids); _stale_retry_log = (
                         "generate_from_blueprint: %s — attempt %d: "
-                        "chunk exclusion fully relaxed (fresh pool)",
-                        item_label, attempt,
-                    )
+                )  # stale retry-relaxation log removed
 
                 logger.info(
                     "generate_from_blueprint: %s — attempt %d/%d "
@@ -511,6 +506,8 @@ def generate_from_blueprint(
                                 retrieval_query=slot_retrieval_query,
                                 exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
+                                _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                _out_downgraded=downgraded_this_attempt,
                                 _out_rejected_stems=_rejected_this,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
@@ -519,6 +516,7 @@ def generate_from_blueprint(
                                 penalize_chunk_ids=effective_penalize,
                                 rejected_stems=slot_rejected_stems or None,
                                 course_subject=course_subject,
+                                allow_difficulty_downgrade=attempt == MAX_SLOT_ATTEMPTS,
                             )
                             slot_rejected_stems.extend(_rejected_this)
                         elif q_type == QuestionType.true_false:
@@ -533,12 +531,15 @@ def generate_from_blueprint(
                                 retrieval_query=slot_retrieval_query,
                                 exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
+                                _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                _out_downgraded=downgraded_this_attempt,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
                                 penalize_chunk_ids=effective_penalize,
                                 course_subject=course_subject,
+                                allow_difficulty_downgrade=attempt == MAX_SLOT_ATTEMPTS,
                             )
                         elif q_type == QuestionType.short_answer:
                             generated = await svc.generate_short_answer(
@@ -552,12 +553,15 @@ def generate_from_blueprint(
                                 retrieval_query=slot_retrieval_query,
                                 exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
+                                _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                _out_downgraded=downgraded_this_attempt,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
                                 penalize_chunk_ids=effective_penalize,
                                 course_subject=course_subject,
+                                allow_difficulty_downgrade=attempt == MAX_SLOT_ATTEMPTS,
                             )
                         elif q_type == QuestionType.essay:
                             generated = await svc.generate_essay(
@@ -571,12 +575,15 @@ def generate_from_blueprint(
                                 retrieval_query=slot_retrieval_query,
                                 exclude_chunk_ids=effective_exclude,
                                 _out_chunk_ids=chunk_ids_this_slot,
+                                _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                _out_downgraded=downgraded_this_attempt,
                                 used_question_stems=used_question_stems,
                                 target_bloom=base_bloom,
                                 diversity_ctx=diversity_ctx,
                                 generation_seed=attempt_seed,
                                 penalize_chunk_ids=effective_penalize,
                                 course_subject=course_subject,
+                                allow_difficulty_downgrade=attempt == MAX_SLOT_ATTEMPTS,
                             )
                         else:
                             logger.warning(
@@ -595,7 +602,10 @@ def generate_from_blueprint(
                             total_generated += len(generated)
                             generated_this = True
                             # Register chunks as used so subsequent slots pull different material.
-                            used_chunk_ids.update(chunk_ids_this_slot)
+                            used_chunk_ids.update(support_chunk_ids_this_slot)
+                            if downgraded_this_attempt:
+                                slot_downgraded.extend(downgraded_this_attempt)
+                                downgraded_questions.extend(downgraded_this_attempt)
 
                             # Insert blueprint_questions mapping rows for each generated question.
                             try:
@@ -619,7 +629,12 @@ def generate_from_blueprint(
                                 "(used_chunks=%d chunk_ids=%s)",
                                 item_label, attempt,
                                 len(used_chunk_ids),
-                                [str(c)[:8] for c in chunk_ids_this_slot],
+                                [
+                                    str(c)[:8]
+                                    for c in (
+                                        support_chunk_ids_this_slot or chunk_ids_this_slot
+                                    )
+                                ],
                             )
                             break
                         else:
@@ -646,9 +661,13 @@ def generate_from_blueprint(
             # chunk neighborhoods by (a) keeping failed chunks excluded and
             # (b) perturbing the retrieval query with different semantic angles.
             if not generated_this and MAX_SLOT_RESCUE_ATTEMPTS > 0:
-                rescue_exclude_chunk_ids: set[uuid.UUID] = set(retry_exclude_chunk_ids)
+                rescue_exclude_chunk_ids: set[uuid.UUID] = (
+                    set(retry_exclude_chunk_ids) | set(used_chunk_ids)
+                )
                 for rescue_idx in range(1, MAX_SLOT_RESCUE_ATTEMPTS + 1):
                     chunk_ids_this_slot = []
+                    support_chunk_ids_this_slot = []
+                    downgraded_this_attempt = []
                     rescue_suffix = _RESCUE_QUERY_SUFFIXES[
                         (rescue_idx - 1) % len(_RESCUE_QUERY_SUFFIXES)
                     ]
@@ -680,6 +699,8 @@ def generate_from_blueprint(
                                     retrieval_query=rescue_query,
                                     exclude_chunk_ids=rescue_exclude_chunk_ids,
                                     _out_chunk_ids=chunk_ids_this_slot,
+                                    _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                    _out_downgraded=downgraded_this_attempt,
                                     _out_rejected_stems=_rejected_this,
                                     used_question_stems=used_question_stems,
                                     target_bloom=base_bloom,
@@ -688,6 +709,7 @@ def generate_from_blueprint(
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     rejected_stems=slot_rejected_stems or None,
                                     course_subject=course_subject,
+                                    allow_difficulty_downgrade=False,
                                 )
                                 slot_rejected_stems.extend(_rejected_this)
                             elif q_type == QuestionType.true_false:
@@ -702,12 +724,15 @@ def generate_from_blueprint(
                                     retrieval_query=rescue_query,
                                     exclude_chunk_ids=rescue_exclude_chunk_ids,
                                     _out_chunk_ids=chunk_ids_this_slot,
+                                    _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                    _out_downgraded=downgraded_this_attempt,
                                     used_question_stems=used_question_stems,
                                     target_bloom=base_bloom,
                                     diversity_ctx=diversity_ctx,
                                     generation_seed=rescue_seed,
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     course_subject=course_subject,
+                                    allow_difficulty_downgrade=False,
                                 )
                             elif q_type == QuestionType.short_answer:
                                 generated = await svc.generate_short_answer(
@@ -721,12 +746,15 @@ def generate_from_blueprint(
                                     retrieval_query=rescue_query,
                                     exclude_chunk_ids=rescue_exclude_chunk_ids,
                                     _out_chunk_ids=chunk_ids_this_slot,
+                                    _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                    _out_downgraded=downgraded_this_attempt,
                                     used_question_stems=used_question_stems,
                                     target_bloom=base_bloom,
                                     diversity_ctx=diversity_ctx,
                                     generation_seed=rescue_seed,
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     course_subject=course_subject,
+                                    allow_difficulty_downgrade=False,
                                 )
                             elif q_type == QuestionType.essay:
                                 generated = await svc.generate_essay(
@@ -740,12 +768,15 @@ def generate_from_blueprint(
                                     retrieval_query=rescue_query,
                                     exclude_chunk_ids=rescue_exclude_chunk_ids,
                                     _out_chunk_ids=chunk_ids_this_slot,
+                                    _out_support_chunk_ids=support_chunk_ids_this_slot,
+                                    _out_downgraded=downgraded_this_attempt,
                                     used_question_stems=used_question_stems,
                                     target_bloom=base_bloom,
                                     diversity_ctx=diversity_ctx,
                                     generation_seed=rescue_seed,
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     course_subject=course_subject,
+                                    allow_difficulty_downgrade=False,
                                 )
                             else:
                                 generated = []
@@ -754,7 +785,10 @@ def generate_from_blueprint(
                                 generated = generated[:1]
                                 total_generated += len(generated)
                                 generated_this = True
-                                used_chunk_ids.update(chunk_ids_this_slot)
+                                used_chunk_ids.update(support_chunk_ids_this_slot)
+                                if downgraded_this_attempt:
+                                    slot_downgraded.extend(downgraded_this_attempt)
+                                    downgraded_questions.extend(downgraded_this_attempt)
 
                                 try:
                                     from app.models.exam import BlueprintQuestion as _BPQ
@@ -779,7 +813,12 @@ def generate_from_blueprint(
                                     item_label,
                                     rescue_idx,
                                     len(used_chunk_ids),
-                                    [str(c)[:8] for c in chunk_ids_this_slot],
+                                    [
+                                        str(c)[:8]
+                                        for c in (
+                                            support_chunk_ids_this_slot or chunk_ids_this_slot
+                                        )
+                                    ],
                                 )
                                 # Surface the actual rescue retrieval query in diagnostics.
                                 slot_retrieval_query = rescue_query
@@ -817,9 +856,19 @@ def generate_from_blueprint(
                 "type": q_type.value,
                 "topic": topic_name,
                 "diff": diff_str,
+                "accepted_difficulty": (
+                    slot_downgraded[0]["accepted_difficulty"]
+                    if slot_downgraded
+                    else diff_str
+                ),
+                "downgraded": bool(slot_downgraded),
+                "downgrade_reason": (
+                    slot_downgraded[0]["reason"] if slot_downgraded else None
+                ),
                 "bloom": base_bloom,
                 "retrieval_query": slot_retrieval_query,
                 "chunk_ids": [str(c) for c in chunk_ids_this_slot],
+                "support_chunk_ids": [str(c) for c in support_chunk_ids_this_slot],
                 "success": generated_this,
             })
 
@@ -845,6 +894,8 @@ def generate_from_blueprint(
             "failed": failed_count,
             "failure_reasons": failure_reasons[:20],
             "unique_chunks_used": len(used_chunk_ids),
+            "downgraded_count": len(downgraded_questions),
+            "downgraded_questions": downgraded_questions,
             "trivial_questions": trivial_in_job,
             "trivial_fraction": round(trivial_in_job / max(total_generated, 1), 2),
             # Diversity / rejection-memory stats
@@ -866,7 +917,7 @@ def generate_from_blueprint(
                 job.progress = 100
                 job.message = final_message[:500]
                 # Store full summary in error field (Text column) when partial.
-                if is_partial or failure_reasons:
+                if is_partial or failure_reasons or downgraded_questions:
                     job.error = _json2.dumps(summary, default=str)
                 await db.flush()
                 await db.commit()
