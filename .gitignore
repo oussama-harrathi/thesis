@@ -36,6 +36,10 @@ Thumbs.db
 .vscode/settings.json
 .idea/
 
+# Local planning and assistant instructions
+TASKS.md
+.github/copilot-instructions.md
+
 # Uploads
 Backend/uploads/
 *.pdf
