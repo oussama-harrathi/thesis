@@ -41,7 +41,21 @@ import type {
   ExportPairResponse,
 } from '../types/api'
 
-const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string) ?? ''
+const RAW_BASE_URL = ((import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '').trim()
+
+function shouldUseDevProxy(baseUrl: string): boolean {
+  if (!import.meta.env.DEV) return false
+  if (!baseUrl) return true
+
+  try {
+    const { hostname } = new URL(baseUrl)
+    return hostname === 'localhost' || hostname === '127.0.0.1'
+  } catch {
+    return false
+  }
+}
+
+const BASE_URL = shouldUseDevProxy(RAW_BASE_URL) ? '' : RAW_BASE_URL
 
 export class ApiError extends Error {
   constructor(
@@ -58,11 +72,14 @@ async function apiRequest<T>(
   options?: RequestInit,
 ): Promise<T> {
   const url = `${BASE_URL}/api/v1${path}`
+  const headers = new Headers(options?.headers)
+
+  if (typeof options?.body === 'string' && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
   const res = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
+    headers,
     ...options,
   })
 
@@ -132,7 +149,7 @@ export const documentsApi = {
     apiRequest<Document[]>(`/courses/${courseId}/documents`),
 
   delete: (documentId: string) =>
-    fetch(`${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/documents/${documentId}`, {
+    fetch(`${BASE_URL}/api/v1/documents/${documentId}`, {
       method: 'DELETE',
     }).then(async (res) => {
       if (!res.ok && res.status !== 204) {
@@ -160,7 +177,7 @@ export const topicsApi = {
     }),
 
   delete: (topicId: string) =>
-    fetch(`${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/topics/${topicId}`, {
+    fetch(`${BASE_URL}/api/v1/topics/${topicId}`, {
       method: 'DELETE',
     }).then(async (res) => {
       if (!res.ok && res.status !== 204) {
@@ -250,7 +267,7 @@ export const questionsApi = {
     body: ReplaceQuestionRequest,
   ) =>
     fetch(
-      `${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/blueprints/${blueprintId}/questions/${questionId}/replace`,
+      `${BASE_URL}/api/v1/blueprints/${blueprintId}/questions/${questionId}/replace`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -336,7 +353,7 @@ export const examsApi = {
   /** DELETE /api/v1/exams/{examId}/questions/{examQuestionId} */
   removeQuestion: (examId: string, examQuestionId: string) =>
     fetch(
-      `${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/exams/${examId}/questions/${examQuestionId}`,
+      `${BASE_URL}/api/v1/exams/${examId}/questions/${examQuestionId}`,
       { method: 'DELETE' },
     ).then(async (res) => {
       if (!res.ok && res.status !== 204) {
@@ -359,7 +376,7 @@ export const exportsApi = {
 
   /** Construct the download URL (opened via window.open / anchor) */
   downloadUrl: (exportId: string) =>
-    `${(import.meta.env.VITE_API_BASE_URL as string) ?? ''}/api/v1/exports/${exportId}/download`,
+    `${BASE_URL}/api/v1/exports/${exportId}/download`,
 }
 
 // ── Student Practice ──────────────────────────────────────────
