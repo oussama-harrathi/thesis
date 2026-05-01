@@ -31,6 +31,7 @@ import re
 import uuid
 from typing import Any, Sequence
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.llm.base import BaseLLMProvider, GenerationSettings
@@ -55,6 +56,7 @@ from app.models.question import (
     QuestionType,
     QuestionValidation,
 )
+from app.models.topic import Topic, TopicChunkMap
 from app.schemas.llm_outputs import (
     EssayGenerationOutput,
     EssayQuestionOutput,
@@ -67,6 +69,7 @@ from app.schemas.llm_outputs import (
 )
 from app.services.context_builder import ContextBuilder
 from app.services.diversity_service import DiversityContext, DiversityService
+from app.services.topic_extraction.orchestrator import get_extraction_meta
 from app.services.retrieval_service import (
     RetrievalService,
     RetrievedChunk,
@@ -92,6 +95,7 @@ SA_PROMPT_VERSION = "sa-v3"
 ESSAY_PROMPT_VERSION = "essay-v2"
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_TOPIC_WORD_RE = re.compile(r"[A-Za-z0-9']+")
 _VAGUE_COMMON_SENSE_RE = re.compile(
     r"\b(common sense|foreseeable future|highly likely|unlikely|neutral"
     r"|too good to be true|practical in the foreseeable future)\b",
@@ -115,6 +119,9 @@ _HARD_REASONING_SIGNAL_RE = re.compile(
     r"trade[- ]off|limitation|justify)\b",
     re.IGNORECASE,
 )
+_COARSE_TOC_LEVELS = {"PART", "CHAPTER"}
+_COARSE_TOC_MAX_WORDS = 4
+_COARSE_TOC_MIN_COVERAGE = 0.18
 
 
 class QuestionGenerationService:
@@ -309,6 +316,43 @@ class QuestionGenerationService:
             return Difficulty.medium
         return Difficulty.easy
 
+    @staticmethod
+    def _triviality_gate_reason(text: str, difficulty: str, bloom: str) -> str | None:
+        """Return a rejection reason when a question is too trivial for the slot."""
+        if not should_reject_trivial(text, difficulty, bloom):
+            return None
+        return (
+            f"question is simple recall/trivial for a {difficulty} "
+            f"{bloom} slot"
+        )
+
+    def _resolve_generation_acceptance(
+        self,
+        *,
+        text: str,
+        difficulty: str,
+        bloom: str,
+        allow_difficulty_downgrade: bool,
+    ) -> tuple[str | None, str | None]:
+        """
+        Decide whether a generated item fits the requested slot difficulty.
+
+        Returns `(accepted_difficulty, reason)`:
+        - `(difficulty, None)` when the item fits as-is
+        - `(<lower difficulty>, reason)` when it should be accepted downgraded
+        - `(None, reason)` when it must be rejected
+        """
+        triviality_reason = self._triviality_gate_reason(text, difficulty, bloom)
+        difficulty_reason = self._difficulty_gate_reason(text, difficulty)
+        gate_reason = triviality_reason or difficulty_reason
+
+        if gate_reason is None:
+            return difficulty, None
+        if not allow_difficulty_downgrade:
+            return None, gate_reason
+
+        return self._downgraded_difficulty(text, difficulty).value, gate_reason
+
     async def _persist_difficulty_downgrade(
         self,
         db: AsyncSession,
@@ -364,6 +408,70 @@ class QuestionGenerationService:
                 course_id, exc,
             )
             return ""
+
+    async def _resolve_topic_focus(
+        self,
+        db: AsyncSession,
+        *,
+        course_id: uuid.UUID,
+        topic_id: uuid.UUID | None,
+        topic_name: str,
+        difficulty: str,
+    ) -> tuple[uuid.UUID | None, str | None]:
+        """
+        Decide whether topic-mapped retrieval is trustworthy for this request.
+
+        When the extraction is low-confidence or the selected topic looks like a
+        coarse navigation bucket, we bypass the topic map and let retrieval work
+        course-wide from semantically coherent chunks instead.
+        """
+        if topic_id is None:
+            return None, None
+
+        extraction_meta = get_extraction_meta(course_id)
+        if extraction_meta is not None and extraction_meta.is_low_confidence:
+            return None, (
+                "course topic extraction is low-confidence; using chunk-based "
+                "retrieval instead of topic mappings"
+            )
+
+        result = await db.execute(
+            select(
+                Topic,
+                func.count(TopicChunkMap.id).label("chunk_count"),
+            )
+            .outerjoin(TopicChunkMap, TopicChunkMap.topic_id == Topic.id)
+            .where(Topic.id == topic_id)
+            .group_by(Topic.id)
+        )
+        row = result.first()
+        if row is None:
+            return None, "selected topic was not found; using chunk-based retrieval"
+
+        topic: Topic = row[0]
+        chunk_count = int(row[1] or 0)
+        if not topic.is_auto_extracted:
+            return topic_id, None
+
+        if chunk_count == 0 or (topic.coverage_score is not None and topic.coverage_score < 0.01):
+            return None, "topic has no reliable chunk mappings; using chunk-based retrieval"
+
+        topic_word_count = len(_TOPIC_WORD_RE.findall(topic.name or topic_name))
+        if (
+            topic.source == "TOC"
+            and (topic.level or "").upper() in _COARSE_TOC_LEVELS
+            and topic_word_count <= _COARSE_TOC_MAX_WORDS
+            and (topic.coverage_score or 0.0) >= _COARSE_TOC_MIN_COVERAGE
+        ):
+            return None, (
+                "topic looks like a coarse TOC bucket; using chunk-based retrieval "
+                "instead of topic mappings"
+            )
+
+        # Narrow auto-extracted topics can still work even when they only have a
+        # small mapping set because query-based retrieval will supplement them.
+        _ = difficulty
+        return topic_id, None
 
     # ------------------------------------------------------------------ #
     # MCQ Generation                                                       #
@@ -422,6 +530,21 @@ class QuestionGenerationService:
         course_subject = await self._resolve_course_subject(
             db, course_id=course_id, course_subject=course_subject,
         )
+        effective_topic_id, topic_fallback_reason = await self._resolve_topic_focus(
+            db,
+            course_id=course_id,
+            topic_id=topic_id,
+            topic_name=topic_name,
+            difficulty=difficulty,
+        )
+        if topic_fallback_reason is not None:
+            logger.info(
+                "generate_mcq: topic fallback for course=%s topic=%r topic_id=%s: %s",
+                course_id,
+                topic_name,
+                topic_id,
+                topic_fallback_reason,
+            )
         query = retrieval_query or self.build_retrieval_query_seed(
             topic_name,
             QuestionType.mcq.value,
@@ -432,7 +555,7 @@ class QuestionGenerationService:
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
-            topic_id=topic_id,
+            topic_id=effective_topic_id,
             course_id=course_id,
             top_k=top_k_chunks,
             min_score=0.1,
@@ -446,7 +569,7 @@ class QuestionGenerationService:
         logger.info(
             "generate_mcq: retrieved %d chunks for course=%s topic=%r topic_id=%s "
             "(min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, required_chunks,
+            len(chunks), course_id, topic_name, effective_topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -578,13 +701,6 @@ class QuestionGenerationService:
                         sim, q_output.stem[:80],
                     )
                     continue
-            # Triviality guard: skip trivial stems for medium/hard slots.
-            if should_reject_trivial(q_output.stem, difficulty, bloom):
-                logger.warning(
-                    "generate_mcq: TRIVIAL stem for %s/%s — skipping stem=%r",
-                    difficulty, bloom, q_output.stem[:80],
-                )
-                continue
             # Context-leak guard: reject questions that mention "the provided context" etc.
             if should_reject_context_leak(q_output.stem):
                 logger.warning(
@@ -594,30 +710,28 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────
-            accepted_difficulty = difficulty
-            difficulty_gate_reason = self._difficulty_gate_reason(
-                q_output.stem, difficulty
+            accepted_difficulty, downgrade_reason = self._resolve_generation_acceptance(
+                text=q_output.stem,
+                difficulty=difficulty,
+                bloom=bloom,
+                allow_difficulty_downgrade=allow_difficulty_downgrade,
             )
-            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
-            if difficulty_gate_reason is not None and not downgraded:
+            if accepted_difficulty is None:
                 logger.warning(
-                    "generate_mcq: DIFFICULTY GATE - rejecting %s stem=%r",
-                    difficulty_gate_reason,
+                    "generate_mcq: DIFFICULTY/TRIVIALITY GATE - rejecting %s stem=%r",
+                    downgrade_reason,
                     q_output.stem[:80],
                 )
                 if _out_rejected_stems is not None:
                     _out_rejected_stems.append(q_output.stem)
                 continue
-            if downgraded:
-                accepted_difficulty = self._downgraded_difficulty(
-                    q_output.stem, difficulty
-                ).value
+            if downgrade_reason is not None:
                 logger.warning(
-                    "generate_mcq: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "generate_mcq: DIFFICULTY/TRIVIALITY GATE - accepting downgraded %s→%s "
                     "because %s stem=%r",
                     difficulty,
                     accepted_difficulty,
-                    difficulty_gate_reason,
+                    downgrade_reason,
                     q_output.stem[:80],
                 )
 
@@ -707,13 +821,13 @@ class QuestionGenerationService:
                     _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.stem)
-                if difficulty_gate_reason is not None:
+                if downgrade_reason is not None:
                     await self._persist_difficulty_downgrade(
                         db,
                         question=question,
                         requested_difficulty=difficulty,
                         accepted_difficulty=accepted_difficulty,
-                        reason=difficulty_gate_reason,
+                        reason=downgrade_reason,
                     )
                     if _out_downgraded is not None:
                         _out_downgraded.append(
@@ -721,7 +835,7 @@ class QuestionGenerationService:
                                 "question_id": str(question.id),
                                 "requested_difficulty": difficulty,
                                 "accepted_difficulty": accepted_difficulty,
-                                "reason": difficulty_gate_reason,
+                                "reason": downgrade_reason,
                             }
                         )
                 await self._run_validators(
@@ -933,6 +1047,21 @@ class QuestionGenerationService:
         course_subject = await self._resolve_course_subject(
             db, course_id=course_id, course_subject=course_subject,
         )
+        effective_topic_id, topic_fallback_reason = await self._resolve_topic_focus(
+            db,
+            course_id=course_id,
+            topic_id=topic_id,
+            topic_name=topic_name,
+            difficulty=difficulty,
+        )
+        if topic_fallback_reason is not None:
+            logger.info(
+                "generate_true_false: topic fallback for course=%s topic=%r topic_id=%s: %s",
+                course_id,
+                topic_name,
+                topic_id,
+                topic_fallback_reason,
+            )
         query = retrieval_query or self.build_retrieval_query_seed(
             topic_name,
             QuestionType.true_false.value,
@@ -943,7 +1072,7 @@ class QuestionGenerationService:
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
-            topic_id=topic_id,
+            topic_id=effective_topic_id,
             course_id=course_id,
             top_k=top_k_chunks,
             min_score=0.1,
@@ -957,7 +1086,7 @@ class QuestionGenerationService:
         logger.info(
             "generate_true_false: retrieved %d chunks for course=%s topic=%r topic_id=%s "
             "(min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, required_chunks,
+            len(chunks), course_id, topic_name, effective_topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -1049,13 +1178,6 @@ class QuestionGenerationService:
                         sim, q_output.statement[:80],
                     )
                     continue
-            # Triviality guard
-            if should_reject_trivial(q_output.statement, difficulty, bloom):
-                logger.warning(
-                    "generate_true_false: TRIVIAL for %s/%s — skipping statement=%r",
-                    difficulty, bloom, q_output.statement[:80],
-                )
-                continue
             # Context-leak guard
             if should_reject_context_leak(q_output.statement):
                 logger.warning(
@@ -1065,28 +1187,26 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────────
-            accepted_difficulty = difficulty
-            difficulty_gate_reason = self._difficulty_gate_reason(
-                q_output.statement, difficulty
+            accepted_difficulty, downgrade_reason = self._resolve_generation_acceptance(
+                text=q_output.statement,
+                difficulty=difficulty,
+                bloom=bloom,
+                allow_difficulty_downgrade=allow_difficulty_downgrade,
             )
-            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
-            if difficulty_gate_reason is not None and not downgraded:
+            if accepted_difficulty is None:
                 logger.warning(
-                    "generate_true_false: DIFFICULTY GATE - rejecting %s statement=%r",
-                    difficulty_gate_reason,
+                    "generate_true_false: DIFFICULTY/TRIVIALITY GATE - rejecting %s statement=%r",
+                    downgrade_reason,
                     q_output.statement[:80],
                 )
                 continue
-            if downgraded:
-                accepted_difficulty = self._downgraded_difficulty(
-                    q_output.statement, difficulty
-                ).value
+            if downgrade_reason is not None:
                 logger.warning(
-                    "generate_true_false: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "generate_true_false: DIFFICULTY/TRIVIALITY GATE - accepting downgraded %s→%s "
                     "because %s statement=%r",
                     difficulty,
                     accepted_difficulty,
-                    difficulty_gate_reason,
+                    downgrade_reason,
                     q_output.statement[:80],
                 )
 
@@ -1176,13 +1296,13 @@ class QuestionGenerationService:
                     _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.statement)
-                if difficulty_gate_reason is not None:
+                if downgrade_reason is not None:
                     await self._persist_difficulty_downgrade(
                         db,
                         question=question,
                         requested_difficulty=difficulty,
                         accepted_difficulty=accepted_difficulty,
-                        reason=difficulty_gate_reason,
+                        reason=downgrade_reason,
                     )
                     if _out_downgraded is not None:
                         _out_downgraded.append(
@@ -1190,7 +1310,7 @@ class QuestionGenerationService:
                                 "question_id": str(question.id),
                                 "requested_difficulty": difficulty,
                                 "accepted_difficulty": accepted_difficulty,
-                                "reason": difficulty_gate_reason,
+                                "reason": downgrade_reason,
                             }
                         )
                 await self._run_validators(
@@ -1257,6 +1377,21 @@ class QuestionGenerationService:
         course_subject = await self._resolve_course_subject(
             db, course_id=course_id, course_subject=course_subject,
         )
+        effective_topic_id, topic_fallback_reason = await self._resolve_topic_focus(
+            db,
+            course_id=course_id,
+            topic_id=topic_id,
+            topic_name=topic_name,
+            difficulty=difficulty,
+        )
+        if topic_fallback_reason is not None:
+            logger.info(
+                "generate_short_answer: topic fallback for course=%s topic=%r topic_id=%s: %s",
+                course_id,
+                topic_name,
+                topic_id,
+                topic_fallback_reason,
+            )
         query = retrieval_query or self.build_retrieval_query_seed(
             topic_name,
             QuestionType.short_answer.value,
@@ -1267,7 +1402,7 @@ class QuestionGenerationService:
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
-            topic_id=topic_id,
+            topic_id=effective_topic_id,
             course_id=course_id,
             top_k=top_k_chunks,
             min_score=0.1,
@@ -1281,7 +1416,7 @@ class QuestionGenerationService:
         logger.info(
             "generate_short_answer: retrieved %d chunks for course=%s topic=%r "
             "topic_id=%s (min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, required_chunks,
+            len(chunks), course_id, topic_name, effective_topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -1390,13 +1525,6 @@ class QuestionGenerationService:
                         sim, q_output.question[:80],
                     )
                     continue
-            # Triviality guard
-            if should_reject_trivial(q_output.question, difficulty, bloom):
-                logger.warning(
-                    "generate_short_answer: TRIVIAL for %s/%s — skipping q=%r",
-                    difficulty, bloom, q_output.question[:80],
-                )
-                continue
             # Context-leak guard
             if should_reject_context_leak(q_output.question):
                 logger.warning(
@@ -1406,28 +1534,26 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────────
-            accepted_difficulty = difficulty
-            difficulty_gate_reason = self._difficulty_gate_reason(
-                q_output.question, difficulty
+            accepted_difficulty, downgrade_reason = self._resolve_generation_acceptance(
+                text=q_output.question,
+                difficulty=difficulty,
+                bloom=bloom,
+                allow_difficulty_downgrade=allow_difficulty_downgrade,
             )
-            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
-            if difficulty_gate_reason is not None and not downgraded:
+            if accepted_difficulty is None:
                 logger.warning(
-                    "generate_short_answer: DIFFICULTY GATE - rejecting %s q=%r",
-                    difficulty_gate_reason,
+                    "generate_short_answer: DIFFICULTY/TRIVIALITY GATE - rejecting %s q=%r",
+                    downgrade_reason,
                     q_output.question[:80],
                 )
                 continue
-            if downgraded:
-                accepted_difficulty = self._downgraded_difficulty(
-                    q_output.question, difficulty
-                ).value
+            if downgrade_reason is not None:
                 logger.warning(
-                    "generate_short_answer: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "generate_short_answer: DIFFICULTY/TRIVIALITY GATE - accepting downgraded %s→%s "
                     "because %s q=%r",
                     difficulty,
                     accepted_difficulty,
-                    difficulty_gate_reason,
+                    downgrade_reason,
                     q_output.question[:80],
                 )
 
@@ -1484,13 +1610,13 @@ class QuestionGenerationService:
                     _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.question)
-                if difficulty_gate_reason is not None:
+                if downgrade_reason is not None:
                     await self._persist_difficulty_downgrade(
                         db,
                         question=question,
                         requested_difficulty=difficulty,
                         accepted_difficulty=accepted_difficulty,
-                        reason=difficulty_gate_reason,
+                        reason=downgrade_reason,
                     )
                     if _out_downgraded is not None:
                         _out_downgraded.append(
@@ -1498,7 +1624,7 @@ class QuestionGenerationService:
                                 "question_id": str(question.id),
                                 "requested_difficulty": difficulty,
                                 "accepted_difficulty": accepted_difficulty,
-                                "reason": difficulty_gate_reason,
+                                "reason": downgrade_reason,
                             }
                         )
                 await self._run_validators(db, question, is_mcq=False,
@@ -1563,6 +1689,21 @@ class QuestionGenerationService:
         course_subject = await self._resolve_course_subject(
             db, course_id=course_id, course_subject=course_subject,
         )
+        effective_topic_id, topic_fallback_reason = await self._resolve_topic_focus(
+            db,
+            course_id=course_id,
+            topic_id=topic_id,
+            topic_name=topic_name,
+            difficulty=difficulty,
+        )
+        if topic_fallback_reason is not None:
+            logger.info(
+                "generate_essay: topic fallback for course=%s topic=%r topic_id=%s: %s",
+                course_id,
+                topic_name,
+                topic_id,
+                topic_fallback_reason,
+            )
         query = retrieval_query or self.build_retrieval_query_seed(
             topic_name,
             QuestionType.essay.value,
@@ -1573,7 +1714,7 @@ class QuestionGenerationService:
         chunks: list[RetrievedChunk] = await self._retrieval.retrieve_for_generation(
             db,
             query=query,
-            topic_id=topic_id,
+            topic_id=effective_topic_id,
             course_id=course_id,
             top_k=top_k_chunks,
             min_score=0.1,
@@ -1587,7 +1728,7 @@ class QuestionGenerationService:
         logger.info(
             "generate_essay: retrieved %d chunks for course=%s topic=%r "
             "topic_id=%s (min_required=%d) context_chars=%d",
-            len(chunks), course_id, topic_name, topic_id, required_chunks,
+            len(chunks), course_id, topic_name, effective_topic_id, required_chunks,
             sum(len(c.content) for c in chunks),
         )
 
@@ -1689,13 +1830,6 @@ class QuestionGenerationService:
                     )
                     continue
 
-            # Triviality guard (essays at medium/hard must not be recall-only).
-            if should_reject_trivial(q_output.question, difficulty, bloom):
-                logger.warning(
-                    "generate_essay: TRIVIAL for %s/%s — skipping q=%r",
-                    difficulty, bloom, q_output.question[:80],
-                )
-                continue
             # Context-leak guard
             if should_reject_context_leak(q_output.question):
                 logger.warning(
@@ -1705,28 +1839,26 @@ class QuestionGenerationService:
                 continue
 
             # ── Diversity checks: fingerprint + embedding ──────────────────
-            accepted_difficulty = difficulty
-            difficulty_gate_reason = self._difficulty_gate_reason(
-                q_output.question, difficulty
+            accepted_difficulty, downgrade_reason = self._resolve_generation_acceptance(
+                text=q_output.question,
+                difficulty=difficulty,
+                bloom=bloom,
+                allow_difficulty_downgrade=allow_difficulty_downgrade,
             )
-            downgraded = difficulty_gate_reason is not None and allow_difficulty_downgrade
-            if difficulty_gate_reason is not None and not downgraded:
+            if accepted_difficulty is None:
                 logger.warning(
-                    "generate_essay: DIFFICULTY GATE - rejecting %s q=%r",
-                    difficulty_gate_reason,
+                    "generate_essay: DIFFICULTY/TRIVIALITY GATE - rejecting %s q=%r",
+                    downgrade_reason,
                     q_output.question[:80],
                 )
                 continue
-            if downgraded:
-                accepted_difficulty = self._downgraded_difficulty(
-                    q_output.question, difficulty
-                ).value
+            if downgrade_reason is not None:
                 logger.warning(
-                    "generate_essay: DIFFICULTY GATE - accepting downgraded %s→%s "
+                    "generate_essay: DIFFICULTY/TRIVIALITY GATE - accepting downgraded %s→%s "
                     "because %s q=%r",
                     difficulty,
                     accepted_difficulty,
-                    difficulty_gate_reason,
+                    downgrade_reason,
                     q_output.question[:80],
                 )
 
@@ -1783,13 +1915,13 @@ class QuestionGenerationService:
                     _out_support_chunk_ids.extend(c.chunk_id for c in support_chunks)
                 if used_question_stems is not None:
                     used_question_stems.append(q_output.question)
-                if difficulty_gate_reason is not None:
+                if downgrade_reason is not None:
                     await self._persist_difficulty_downgrade(
                         db,
                         question=question,
                         requested_difficulty=difficulty,
                         accepted_difficulty=accepted_difficulty,
-                        reason=difficulty_gate_reason,
+                        reason=downgrade_reason,
                     )
                     if _out_downgraded is not None:
                         _out_downgraded.append(
@@ -1797,7 +1929,7 @@ class QuestionGenerationService:
                                 "question_id": str(question.id),
                                 "requested_difficulty": difficulty,
                                 "accepted_difficulty": accepted_difficulty,
-                                "reason": difficulty_gate_reason,
+                                "reason": downgrade_reason,
                             }
                         )
                 await self._run_validators(db, question, is_mcq=False,

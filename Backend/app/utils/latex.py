@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -89,11 +90,9 @@ def _find_pdflatex() -> Path | None:
 
 # ── Character escaping ────────────────────────────────────────────
 
-# Single-pass regex: finds all LaTeX-special characters in one scan so that
-# replacement strings (e.g. \textbackslash{}) are never processed a second time.
-_SPECIAL_CHARS_RE = re.compile(r"([\\&%$#_{}~^])")
-
-_CHAR_MAP: dict[str, str] = {
+# Single-pass escaping for LaTeX control characters plus direct conversion of
+# common Unicode STEM symbols into pdflatex-safe LaTeX macros.
+_SPECIAL_CHAR_MAP: dict[str, str] = {
     "\\": r"\textbackslash{}",
     "&":  r"\&",
     "%":  r"\%",
@@ -106,17 +105,182 @@ _CHAR_MAP: dict[str, str] = {
     "^":  r"\textasciicircum{}",
 }
 
+_UNICODE_LATEX_MAP: dict[str, str] = {
+    # Greek letters commonly produced in STEM content.
+    "α": r"\ensuremath{\alpha}",
+    "β": r"\ensuremath{\beta}",
+    "γ": r"\ensuremath{\gamma}",
+    "δ": r"\ensuremath{\delta}",
+    "ε": r"\ensuremath{\epsilon}",
+    "ζ": r"\ensuremath{\zeta}",
+    "η": r"\ensuremath{\eta}",
+    "θ": r"\ensuremath{\theta}",
+    "ι": r"\ensuremath{\iota}",
+    "κ": r"\ensuremath{\kappa}",
+    "λ": r"\ensuremath{\lambda}",
+    "μ": r"\ensuremath{\mu}",
+    "µ": r"\ensuremath{\mu}",
+    "ν": r"\ensuremath{\nu}",
+    "ξ": r"\ensuremath{\xi}",
+    "π": r"\ensuremath{\pi}",
+    "ρ": r"\ensuremath{\rho}",
+    "ς": r"\ensuremath{\varsigma}",
+    "σ": r"\ensuremath{\sigma}",
+    "τ": r"\ensuremath{\tau}",
+    "υ": r"\ensuremath{\upsilon}",
+    "φ": r"\ensuremath{\phi}",
+    "ϕ": r"\ensuremath{\varphi}",
+    "χ": r"\ensuremath{\chi}",
+    "ψ": r"\ensuremath{\psi}",
+    "ω": r"\ensuremath{\omega}",
+    "Γ": r"\ensuremath{\Gamma}",
+    "Δ": r"\ensuremath{\Delta}",
+    "Θ": r"\ensuremath{\Theta}",
+    "Λ": r"\ensuremath{\Lambda}",
+    "Ξ": r"\ensuremath{\Xi}",
+    "Π": r"\ensuremath{\Pi}",
+    "Σ": r"\ensuremath{\Sigma}",
+    "Υ": r"\ensuremath{\Upsilon}",
+    "Φ": r"\ensuremath{\Phi}",
+    "Ψ": r"\ensuremath{\Psi}",
+    "Ω": r"\ensuremath{\Omega}",
+    # Uppercase Greek letters without distinct standard LaTeX commands.
+    "Α": "A",
+    "Β": "B",
+    "Ε": "E",
+    "Ζ": "Z",
+    "Η": "H",
+    "Ι": "I",
+    "Κ": "K",
+    "Μ": "M",
+    "Ν": "N",
+    "Ο": "O",
+    "Ρ": "P",
+    "Τ": "T",
+    "Χ": "X",
+    # Common math, logic, and set notation.
+    "≤": r"\ensuremath{\leq}",
+    "≥": r"\ensuremath{\geq}",
+    "≠": r"\ensuremath{\neq}",
+    "≈": r"\ensuremath{\approx}",
+    "≃": r"\ensuremath{\simeq}",
+    "≅": r"\ensuremath{\cong}",
+    "≡": r"\ensuremath{\equiv}",
+    "±": r"\ensuremath{\pm}",
+    "∓": r"\ensuremath{\mp}",
+    "×": r"\ensuremath{\times}",
+    "÷": r"\ensuremath{\div}",
+    "·": r"\ensuremath{\cdot}",
+    "−": r"\ensuremath{-}",
+    "∝": r"\ensuremath{\propto}",
+    "∞": r"\ensuremath{\infty}",
+    "∂": r"\ensuremath{\partial}",
+    "∇": r"\ensuremath{\nabla}",
+    "∑": r"\ensuremath{\sum}",
+    "∏": r"\ensuremath{\prod}",
+    "∫": r"\ensuremath{\int}",
+    "√": r"\ensuremath{\sqrt{\,}}",
+    "∈": r"\ensuremath{\in}",
+    "∉": r"\ensuremath{\notin}",
+    "∋": r"\ensuremath{\ni}",
+    "∅": r"\ensuremath{\emptyset}",
+    "∪": r"\ensuremath{\cup}",
+    "∩": r"\ensuremath{\cap}",
+    "⊂": r"\ensuremath{\subset}",
+    "⊆": r"\ensuremath{\subseteq}",
+    "⊃": r"\ensuremath{\supset}",
+    "⊇": r"\ensuremath{\supseteq}",
+    "⊄": r"\ensuremath{\not\subset}",
+    "⊕": r"\ensuremath{\oplus}",
+    "⊗": r"\ensuremath{\otimes}",
+    "⊙": r"\ensuremath{\odot}",
+    "⊥": r"\ensuremath{\perp}",
+    "∥": r"\ensuremath{\parallel}",
+    "∣": r"\ensuremath{\mid}",
+    "∀": r"\ensuremath{\forall}",
+    "∃": r"\ensuremath{\exists}",
+    "¬": r"\ensuremath{\neg}",
+    "∧": r"\ensuremath{\land}",
+    "∨": r"\ensuremath{\lor}",
+    "⇒": r"\ensuremath{\Rightarrow}",
+    "⇔": r"\ensuremath{\Leftrightarrow}",
+    "⇐": r"\ensuremath{\Leftarrow}",
+    "→": r"\ensuremath{\rightarrow}",
+    "←": r"\ensuremath{\leftarrow}",
+    "↔": r"\ensuremath{\leftrightarrow}",
+    "↦": r"\ensuremath{\mapsto}",
+    "⊢": r"\ensuremath{\vdash}",
+    "⊨": r"\ensuremath{\models}",
+    "⟨": r"\ensuremath{\langle}",
+    "〈": r"\ensuremath{\langle}",
+    "⟩": r"\ensuremath{\rangle}",
+    "〉": r"\ensuremath{\rangle}",
+    "ℕ": r"\ensuremath{\mathbb{N}}",
+    "ℤ": r"\ensuremath{\mathbb{Z}}",
+    "ℚ": r"\ensuremath{\mathbb{Q}}",
+    "ℝ": r"\ensuremath{\mathbb{R}}",
+    "ℂ": r"\ensuremath{\mathbb{C}}",
+    "°": r"\ensuremath{^\circ}",
+    # Typography and punctuation that otherwise tends to break pdflatex.
+    "–": "--",
+    "—": "---",
+    "“": "``",
+    "”": "''",
+    "„": "``",
+    "‘": "`",
+    "’": "'",
+    "…": r"\ldots{}",
+    "•": r"\textbullet{}",
+}
+
+_LATEX_CHAR_MAP: dict[str, str] = {
+    **_SPECIAL_CHAR_MAP,
+    **_UNICODE_LATEX_MAP,
+}
+
+_MOJIBAKE_MARKERS = ("Ã", "Â", "â", "Î", "Ï", "Ð", "Ñ")
+
+
+def _mojibake_score(text: str) -> int:
+    return sum(text.count(marker) for marker in _MOJIBAKE_MARKERS)
+
+
+def _repair_utf8_mojibake(text: str) -> str:
+    """
+    Repair common UTF-8-as-Windows-1252 mojibake when it is clearly present.
+
+    This is intentionally conservative: we only keep a repaired candidate when
+    it materially reduces the number of typical mojibake marker characters.
+    """
+    if not text or _mojibake_score(text) == 0:
+        return text
+
+    best = text
+    best_score = _mojibake_score(text)
+    for source_encoding in ("cp1252", "latin-1"):
+        try:
+            candidate = text.encode(source_encoding).decode("utf-8")
+        except UnicodeError:
+            continue
+        candidate_score = _mojibake_score(candidate)
+        if candidate_score < best_score:
+            best = candidate
+            best_score = candidate_score
+    return best
+
 
 def latex_escape(text: str) -> str:
     """
     Escape ``text`` so that it is safe to embed verbatim in a LaTeX document.
 
-    Handles all 10 LaTeX special characters in a single regex pass, avoiding
-    double-escaping of the replacement strings themselves.
+    Handles the usual LaTeX special characters and converts common Unicode
+    STEM symbols into pdflatex-safe LaTeX macros.
     """
     if not text:
         return ""
-    return _SPECIAL_CHARS_RE.sub(lambda m: _CHAR_MAP[m.group(0)], text)
+    repaired = _repair_utf8_mojibake(text)
+    normalized = unicodedata.normalize("NFC", repaired)
+    return "".join(_LATEX_CHAR_MAP.get(char, char) for char in normalized)
 
 
 # ── pdflatex availability ─────────────────────────────────────────

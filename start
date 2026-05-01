@@ -12,4 +12,10 @@ $env:Path += ";C:\Users\Oussema\AppData\Local\Programs\MiKTeX\miktex\bin\x64"
 & "d:\Miskolc Thesis\.venv\Scripts\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 
 db:
-docker compose up -d
+# Local development only needs infra services.
+# Do NOT start the Docker backend/frontend/celery stack here, or it will
+# compete with the local uvicorn/Celery processes and consume the same queue.
+docker compose up -d postgres redis
+
+full docker app:
+docker compose --profile app up -d

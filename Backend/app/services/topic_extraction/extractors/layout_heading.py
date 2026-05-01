@@ -1,11 +1,9 @@
 """
-LayoutHeadingExtractor — detects headings from font-size / layout signals.
+LayoutHeadingExtractor - detects headings from font-size and layout signals.
 
-Works best for slide decks, notes, and PDFs where headings are visually
-distinguished (larger font, bold, top-of-page position) but no outline is
-embedded.
-
-Uses PyMuPDF's `page.get_text("dict")` which exposes per-span font size.
+This extractor is for PDFs where headings are visually distinct but no usable
+outline is embedded. It prefers short lines near the top of the page or lines
+separated by clear whitespace, and intentionally rejects sentence-like prose.
 """
 from __future__ import annotations
 
@@ -17,36 +15,83 @@ from typing import Any
 import fitz  # PyMuPDF
 
 from app.services.topic_extraction.base import (
-    METHOD_LAYOUT_HEADINGS,
-    LEVEL_HEADING,
     LEVEL_CHAPTER,
+    LEVEL_HEADING,
     LEVEL_SECTION,
+    METHOD_LAYOUT_HEADINGS,
     ExtractedTopic,
     TopicExtractionResult,
 )
 
 logger = logging.getLogger(__name__)
 
-_HEADING_MAX_LEN = 120
-_HEADING_MIN_LEN = 4
-_MAX_PAGES_TO_SCAN = 300  # cap for very large documents
+_HEADING_MAX_CHARS = 120
+_HEADING_MIN_CHARS = 4
+_MAX_HEADING_WORDS = 12
+_MAX_PAGES_TO_SCAN = 300
+_TOP_PAGE_PORTION = 0.32
+_QUESTION_WORD_LIMIT = 8
+_ALPHA_RE = re.compile(r"[A-Za-z]")
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+_COLLAPSE_WS = re.compile(r"\s+")
 
 
-def _get_spans(page: fitz.Page) -> list[dict[str, Any]]:
-    """Extract all text spans from a page dict."""
-    spans: list[dict[str, Any]] = []
+def _normalize_text(text: str) -> str:
+    return _COLLAPSE_WS.sub(" ", text.strip())
+
+
+def _word_count(text: str) -> int:
+    return len(_WORD_RE.findall(text))
+
+
+def _get_page_lines(page: fitz.Page) -> tuple[list[dict[str, Any]], list[float]]:
+    """Return page lines plus all observed span font sizes."""
+    lines: list[dict[str, Any]] = []
+    font_sizes: list[float] = []
     try:
-        page_dict: dict[str, Any] = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)  # type: ignore[assignment]
-        blocks = page_dict.get("blocks", [])
+        page_dict: dict[str, Any] = page.get_text(
+            "dict",
+            flags=fitz.TEXT_PRESERVE_WHITESPACE,
+        )
     except Exception:  # noqa: BLE001
-        return spans
-    for block in blocks:
-        if block.get("type") != 0:  # text block only
+        return lines, font_sizes
+
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                spans.append(span)
-    return spans
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            bbox = line.get("bbox") or block.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+            text = _normalize_text(
+                " ".join(
+                    str(span.get("text") or "").strip()
+                    for span in spans
+                    if str(span.get("text") or "").strip()
+                )
+            )
+            max_size = 0.0
+            bold = False
+            for span in spans:
+                size = float(span.get("size", 0.0))
+                if size > 0:
+                    font_sizes.append(size)
+                    max_size = max(max_size, size)
+                flags = int(span.get("flags", 0))
+                bold = bold or _is_bold(flags)
+            lines.append(
+                {
+                    "text": text,
+                    "size": max_size,
+                    "bold": bold,
+                    "y0": float(bbox[1]),
+                    "y1": float(bbox[3]),
+                }
+            )
+
+    lines.sort(key=lambda item: (item["y0"], item["y1"]))
+    return lines, font_sizes
 
 
 def _is_bold(flags: int) -> bool:
@@ -54,8 +99,26 @@ def _is_bold(flags: int) -> bool:
     return bool(flags & (1 << 4)) or bool(flags & (1 << 20))
 
 
+def _looks_like_prose(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if not _ALPHA_RE.search(stripped):
+        return True
+    words = _word_count(stripped)
+    if words == 0 or words > _MAX_HEADING_WORDS:
+        return True
+    if stripped.endswith("."):
+        return True
+    if stripped.endswith("?") and words > _QUESTION_WORD_LIMIT:
+        return True
+    if "," in stripped and words > 6:
+        return True
+    return False
+
+
 class LayoutHeadingExtractor:
-    """Heading detector using font-size / bold / position heuristics."""
+    """Heading detector using font-size, position, and whitespace heuristics."""
 
     name = "layout_headings"
 
@@ -80,19 +143,15 @@ class LayoutHeadingExtractor:
             empty.debug_info["error"] = str(exc)
             return empty
 
-        # --- Phase 1: collect all font sizes to establish baseline ----------
-        all_font_sizes: list[float] = []
         pages_to_scan = min(total_pages, _MAX_PAGES_TO_SCAN)
-        span_cache: list[tuple[int, list[dict[str, Any]]]] = []
+        page_cache: list[tuple[int, float, list[dict[str, Any]]]] = []
+        all_font_sizes: list[float] = []
 
         for page_num in range(pages_to_scan):
             page = doc.load_page(page_num)
-            spans = _get_spans(page)
-            span_cache.append((page_num + 1, spans))
-            for sp in spans:
-                sz = sp.get("size", 0.0)
-                if sz > 0:
-                    all_font_sizes.append(sz)
+            lines, font_sizes = _get_page_lines(page)
+            page_cache.append((page_num + 1, float(page.rect.height), lines))
+            all_font_sizes.extend(font_sizes)
 
         doc.close()
 
@@ -101,92 +160,119 @@ class LayoutHeadingExtractor:
 
         try:
             median_size = statistics.median(all_font_sizes)
-        except Exception:
+        except Exception:  # noqa: BLE001
             median_size = 12.0
 
-        heading_threshold = median_size * 1.20  # 20% larger than median
+        heading_threshold = median_size * 1.20
+        heading_lines: list[tuple[int, str, float, float]] = []
 
-        # --- Phase 2: detect heading spans ----------------------------------
-        heading_texts: list[tuple[int, str, float]] = []  # (page, text, font_size)
+        for page_num, page_height, lines in page_cache:
+            prev_y1 = 0.0
+            for idx, line in enumerate(lines):
+                text = line["text"]
+                size = float(line["size"])
+                y0 = float(line["y0"])
+                y1 = float(line["y1"])
+                bold = bool(line["bold"])
 
-        for page_num, spans in span_cache:
-            for sp in spans:
-                text = (sp.get("text") or "").strip()
-                size = float(sp.get("size", 0.0))
-                flags = int(sp.get("flags", 0))
-
-                if not text or len(text) < _HEADING_MIN_LEN:
+                if not text or len(text) < _HEADING_MIN_CHARS:
+                    prev_y1 = max(prev_y1, y1)
                     continue
-                if len(text) > _HEADING_MAX_LEN:
+                if len(text) > _HEADING_MAX_CHARS or _looks_like_prose(text):
+                    prev_y1 = max(prev_y1, y1)
                     continue
-                # Must be bigger than threshold OR bold and decently sized
-                if size >= heading_threshold or (_is_bold(flags) and size >= median_size * 1.05):
-                    heading_texts.append((page_num, text, size))
 
-        if not heading_texts:
+                in_top_region = y0 <= page_height * _TOP_PAGE_PORTION
+                whitespace_above = idx == 0 or (y0 - prev_y1) >= max(8.0, size * 0.85)
+                if not (in_top_region or whitespace_above):
+                    prev_y1 = max(prev_y1, y1)
+                    continue
+
+                big_enough = size >= heading_threshold or (bold and size >= median_size * 1.08)
+                if not big_enough:
+                    prev_y1 = max(prev_y1, y1)
+                    continue
+
+                heading_lines.append((page_num, text, size, y0))
+                prev_y1 = max(prev_y1, y1)
+
+        if not heading_lines:
             return empty
 
-        # --- Phase 3: deduplicate repeated boilerplate ----------------------
-        # If a heading text appears on > 30% of pages it's a boilerplate header
+        # Boilerplate: repeated on many pages.
         text_page_count: dict[str, set[int]] = {}
-        for pg, txt, _ in heading_texts:
+        for pg, txt, _size, _y0 in heading_lines:
             text_page_count.setdefault(txt.lower(), set()).add(pg)
-
         boilerplate: set[str] = {
-            t for t, pages in text_page_count.items()
-            if len(pages) / max(1, pages_to_scan) >= 0.30
+            text
+            for text, pages in text_page_count.items()
+            if len(pages) >= 3 and len(pages) / max(1, pages_to_scan) >= 0.30
         }
 
-        # --- Phase 4: merge consecutive spans on same page ------------------
-        merged: list[tuple[int, str, float]] = []
-        prev_page, prev_text, prev_size = -1, "", 0.0
-        for pg, txt, sz in heading_texts:
-            txt_lo = txt.lower()
-            if txt_lo in boilerplate:
-                continue
-            if pg == prev_page and abs(sz - prev_size) < 1.0:
-                prev_text = (prev_text + " " + txt).strip()
-                prev_size = max(prev_size, sz)
-            else:
-                if prev_text:
-                    merged.append((prev_page, prev_text, prev_size))
-                prev_page, prev_text, prev_size = pg, txt, sz
-        if prev_text:
-            merged.append((prev_page, prev_text, prev_size))
-
-        # --- Phase 5: build topics ------------------------------------------
-        # Assign level: largest-font headings → CHAPTER, medium → SECTION
-        sizes = [sz for _, _, sz in merged]
-        if not sizes:
+        filtered_lines = [
+            item
+            for item in heading_lines
+            if item[1].lower() not in boilerplate
+        ]
+        if not filtered_lines:
             return empty
 
-        size_max = max(sizes)
-        chapter_threshold = size_max * 0.90
+        # Merge only short adjacent lines near the top; do not stitch body prose.
+        merged: list[tuple[int, str, float, float]] = []
+        idx = 0
+        while idx < len(filtered_lines):
+            page_num, text, size, y0 = filtered_lines[idx]
+            merged_text = text
+            merged_size = size
+            next_idx = idx + 1
+            if next_idx < len(filtered_lines):
+                nxt_page, nxt_text, nxt_size, nxt_y0 = filtered_lines[next_idx]
+                same_page = nxt_page == page_num
+                close_in_size = abs(nxt_size - size) <= 1.0
+                close_in_space = 0.0 <= (nxt_y0 - y0) <= max(8.0, size * 0.9)
+                merged_words = _word_count(text) + _word_count(nxt_text)
+                if same_page and close_in_size and close_in_space and merged_words <= _MAX_HEADING_WORDS:
+                    merged_text = _normalize_text(f"{text} {nxt_text}")
+                    merged_size = max(size, nxt_size)
+                    idx += 1
+            merged.append((page_num, merged_text, merged_size, y0))
+            idx += 1
+
+        if not merged:
+            return empty
+
+        size_max = max(size for _, _, size, _ in merged)
+        chapter_threshold = size_max * 0.92
 
         topics: list[ExtractedTopic] = []
-        for i, (pg, txt, sz) in enumerate(merged):
-            level = LEVEL_CHAPTER if sz >= chapter_threshold else (
-                LEVEL_SECTION if sz >= heading_threshold else LEVEL_HEADING
+        for i, (page_num, text, size, _y0) in enumerate(merged):
+            level = LEVEL_CHAPTER if size >= chapter_threshold else (
+                LEVEL_SECTION if size >= heading_threshold else LEVEL_HEADING
             )
-            # end_page: next heading's page - 1
-            end_pg: int | None = merged[i + 1][0] - 1 if i + 1 < len(merged) else None
+            end_page = merged[i + 1][0] - 1 if i + 1 < len(merged) else None
             topics.append(
                 ExtractedTopic(
-                    title=txt,
+                    title=text,
                     level=level,
-                    confidence=min(0.85, 0.50 + 0.005 * len(heading_texts)),
-                    start_page=pg,
-                    end_page=end_pg,
+                    confidence=min(0.78, 0.44 + 0.012 * min(len(merged), 18)),
+                    start_page=page_num,
+                    end_page=end_page,
                 )
             )
 
-        pages_with_headings = len({pg for pg, _, _ in heading_texts if (pg,) not in
-                                    [(pg2,) for pg2, t, _ in heading_texts if t.lower() in boilerplate]})
-        confidence = min(0.82, 0.35 + 0.35 * min(pages_with_headings / max(1, pages_to_scan), 1.0) + 0.02 * min(len(topics), 10))
+        pages_with_headings = len({pg for pg, _, _, _ in filtered_lines})
+        confidence = min(
+            0.78,
+            0.30
+            + 0.30 * min(pages_with_headings / max(1, pages_to_scan), 1.0)
+            + 0.03 * min(len(topics), 8),
+        )
 
         logger.info(
-            "LayoutHeadingExtractor: %d topics from %d heading spans; confidence=%.2f",
-            len(topics), len(heading_texts), confidence,
+            "LayoutHeadingExtractor: %d topics from %d heading lines; confidence=%.2f",
+            len(topics),
+            len(filtered_lines),
+            confidence,
         )
         return TopicExtractionResult(
             topics=topics,
@@ -194,8 +280,7 @@ class LayoutHeadingExtractor:
             overall_confidence=confidence,
             debug_info={
                 "pages_scanned": pages_to_scan,
-                "spans_total": sum(len(s) for _, s in span_cache),
-                "heading_spans": len(heading_texts),
+                "heading_lines": len(filtered_lines),
                 "boilerplate_dropped": len(boilerplate),
                 "topics_found": len(topics),
                 "median_font_size": round(median_size, 2),

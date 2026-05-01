@@ -23,6 +23,7 @@ LEVEL_CLUSTER    = "CLUSTER"   # embedding-cluster extractor
 # ── Method constants ─────────────────────────────────────────────────────────
 
 METHOD_PDF_OUTLINE         = "PDF_OUTLINE"
+METHOD_SLIDE_TITLES       = "SLIDE_TITLES"
 METHOD_LAYOUT_HEADINGS     = "LAYOUT_HEADINGS"
 METHOD_REGEX_HEADINGS      = "REGEX_HEADINGS"
 METHOD_EMBEDDING_CLUSTERS  = "EMBEDDING_CLUSTERS"

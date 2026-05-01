@@ -75,6 +75,10 @@ async def export_result(
 
     Returns (exam_export, answer_key_export).
     """
+    monkeypatch.setattr(
+        "app.services.export_service.pdflatex_available",
+        lambda: False,
+    )
     # Redirect exports to a pytest-managed temp directory so tests don't
     # write to the production export directory.
     monkeypatch.setattr(settings, "EXPORT_DIR", str(tmp_path))

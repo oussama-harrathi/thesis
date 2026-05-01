@@ -136,6 +136,42 @@ class TestLatexEscape:
         assert r"\&" in result
         assert r"\#" in result
 
+    def test_quantum_notation_is_converted_to_latex_math(self):
+        result = latex_escape("|ψ⟩ = α |0⟩ + β |1⟩")
+        assert r"\ensuremath{\psi}" in result
+        assert result.count(r"\ensuremath{\rangle}") == 3
+        assert r"\ensuremath{\alpha}" in result
+        assert r"\ensuremath{\beta}" in result
+
+    def test_set_notation_and_blackboard_bold_are_converted(self):
+        result = latex_escape("Let f: ℝ → ℝ and x ∈ A ∩ B")
+        assert r"\ensuremath{\mathbb{R}}" in result
+        assert r"\ensuremath{\rightarrow}" in result
+        assert r"\ensuremath{\in}" in result
+        assert r"\ensuremath{\cap}" in result
+
+    def test_unicode_minus_sign_is_converted(self):
+        result = latex_escape("e−t/T2")
+        assert result == r"e\ensuremath{-}t/T2"
+
+    def test_smart_punctuation_is_made_latex_safe(self):
+        result = latex_escape("“Superposition” – state evolution…")
+        assert "``Superposition''" in result
+        assert "--" in result
+        assert r"\ldots{}" in result
+
+    def test_mojibake_greek_and_angle_brackets_are_repaired(self):
+        mojibake = "|α⟩ + |ψ⟩".encode("utf-8").decode("cp1252")
+        result = latex_escape(mojibake)
+        assert result.count(r"\ensuremath{\rangle}") == 2
+        assert r"\ensuremath{\alpha}" in result
+        assert r"\ensuremath{\psi}" in result
+
+    def test_mojibake_punctuation_is_repaired(self):
+        mojibake = "lets try — Final Exam".encode("utf-8").decode("cp1252")
+        result = latex_escape(mojibake)
+        assert result == "lets try --- Final Exam"
+
 
 # ── pdflatex_available ────────────────────────────────────────────────────────
 

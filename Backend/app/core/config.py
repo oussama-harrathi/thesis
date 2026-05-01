@@ -142,6 +142,18 @@ class Settings(BaseSettings):
 
         return normalized or DEFAULT_CORS_ORIGINS.copy()
 
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, value: object) -> bool | object:
+        """Accept common environment labels such as 'release' or 'production'."""
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in {"release", "prod", "production"}:
+                return False
+            if raw in {"debug", "dev", "development"}:
+                return True
+        return value
+
 
 # Singleton - import this everywhere
 settings = Settings()

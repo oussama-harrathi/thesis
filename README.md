@@ -216,6 +216,27 @@ cd Backend
 python -m celery -A app.workers.celery_app worker --loglevel=info --pool=solo --without-gossip --without-mingle
 ```
 
+### Local Dev Infrastructure Only
+
+When running the backend and Celery worker locally, start only PostgreSQL and Redis:
+
+```powershell
+docker compose up -d postgres redis
+```
+
+Do not use plain `docker compose up -d` for local dev, because that also starts
+the Docker `backend`, `celery_worker`, and `frontend` services. Those app
+containers will compete with the local `uvicorn` and Celery processes and can
+silently consume question-generation jobs from the same Redis queue.
+
+### Full Docker App
+
+If you intentionally want to run the whole application in Docker, use:
+
+```powershell
+docker compose --profile app up -d
+```
+
 ### Frontend
 
 ```powershell

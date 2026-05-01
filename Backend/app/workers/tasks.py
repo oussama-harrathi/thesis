@@ -709,7 +709,9 @@ def generate_from_blueprint(
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     rejected_stems=slot_rejected_stems or None,
                                     course_subject=course_subject,
-                                    allow_difficulty_downgrade=False,
+                                    allow_difficulty_downgrade=(
+                                        rescue_idx == MAX_SLOT_RESCUE_ATTEMPTS
+                                    ),
                                 )
                                 slot_rejected_stems.extend(_rejected_this)
                             elif q_type == QuestionType.true_false:
@@ -732,7 +734,9 @@ def generate_from_blueprint(
                                     generation_seed=rescue_seed,
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     course_subject=course_subject,
-                                    allow_difficulty_downgrade=False,
+                                    allow_difficulty_downgrade=(
+                                        rescue_idx == MAX_SLOT_RESCUE_ATTEMPTS
+                                    ),
                                 )
                             elif q_type == QuestionType.short_answer:
                                 generated = await svc.generate_short_answer(
@@ -754,7 +758,9 @@ def generate_from_blueprint(
                                     generation_seed=rescue_seed,
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     course_subject=course_subject,
-                                    allow_difficulty_downgrade=False,
+                                    allow_difficulty_downgrade=(
+                                        rescue_idx == MAX_SLOT_RESCUE_ATTEMPTS
+                                    ),
                                 )
                             elif q_type == QuestionType.essay:
                                 generated = await svc.generate_essay(
@@ -776,7 +782,9 @@ def generate_from_blueprint(
                                     generation_seed=rescue_seed,
                                     penalize_chunk_ids=penalize_chunk_ids | used_chunk_ids,
                                     course_subject=course_subject,
-                                    allow_difficulty_downgrade=False,
+                                    allow_difficulty_downgrade=(
+                                        rescue_idx == MAX_SLOT_RESCUE_ATTEMPTS
+                                    ),
                                 )
                             else:
                                 generated = []

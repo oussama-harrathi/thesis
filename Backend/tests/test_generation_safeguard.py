@@ -173,6 +173,42 @@ def test_downgraded_difficulty_steps_medium_question_down_to_easy():
     assert accepted.value == "easy"
 
 
+def test_trivial_medium_question_is_rejected_without_downgrade():
+    """Medium trivial questions should still be rejected when downgrade is disabled."""
+    svc = QuestionGenerationService(
+        provider=MagicMock(),
+        retrieval_service=MagicMock(),
+    )
+
+    accepted, reason = svc._resolve_generation_acceptance(
+        text="What is a qubit?",
+        difficulty="medium",
+        bloom="apply",
+        allow_difficulty_downgrade=False,
+    )
+
+    assert accepted is None
+    assert reason is not None
+
+
+def test_trivial_hard_question_can_be_accepted_downgraded():
+    """Final-attempt hard slots should keep grounded easy questions instead of failing."""
+    svc = QuestionGenerationService(
+        provider=MagicMock(),
+        retrieval_service=MagicMock(),
+    )
+
+    accepted, reason = svc._resolve_generation_acceptance(
+        text="What is the key difference between a classical bit and a qubit?",
+        difficulty="hard",
+        bloom="analyze",
+        allow_difficulty_downgrade=True,
+    )
+
+    assert accepted in {"easy", "medium"}
+    assert reason is not None
+
+
 class TestMCQPreLLMSafeguard:
     @pytest.mark.asyncio
     async def test_all_boilerplate_chunks_blocks_llm(self):
